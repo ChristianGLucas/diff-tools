@@ -1,7 +1,7 @@
 import { UnifiedDiffText, Patch } from '../gen/messages_pb';
 import { AxiomContext } from '../gen/axiomContext';
 import { parsePatch } from 'diff';
-import { BadInput, checkBounds, errorMessage, headerNames, toProtoHunks } from './lib';
+import { BadInput, MAX_LINES, checkBounds, errorMessage, headerNames, toProtoHunks } from './lib';
 
 /**
  * Parse standard unified-diff text (---/+++/@@ hunks) into the canonical Patch
@@ -82,6 +82,23 @@ export function parseUnifiedDiff(ax: AxiomContext, input: UnifiedDiffText): Patc
         if (typeof value !== 'number' || !Number.isFinite(value)) {
           throw new BadInput(
             `unified_diff has a malformed hunk header at hunk ${i}: ${field} is not a number`,
+          );
+        }
+        if (value < 0) {
+          throw new BadInput(
+            `unified_diff has a negative ${field} at hunk ${i}`,
+          );
+        }
+        // Refuse an absurd line number here rather than laundering it into a
+        // Patch envelope. ApplyPatch bounds starts against the text it is given,
+        // but a Patch minted from hostile diff TEXT would otherwise travel
+        // through a flow as a loaded gun: jsdiff's applier scans linearly from
+        // the declared start, so a header of "@@ -2000000000,1 +2000000000,1 @@"
+        // costs ~30s of CPU at the far end. No line number in a diff this
+        // package will accept can legitimately exceed the input line cap.
+        if (value > MAX_LINES) {
+          throw new BadInput(
+            `unified_diff has ${field}=${value} at hunk ${i}, beyond the maximum of ${MAX_LINES} lines`,
           );
         }
       }

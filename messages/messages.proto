@@ -86,9 +86,23 @@ message UnifiedDiffText {
 message PatchApplyRequest {
   // The text the patch applies to.
   string original = 1;
-  // The patch to apply. Its structured hunks are what get applied; the
-  // unified_diff field is ignored by ApplyPatch.
+  // The patch to apply, as the canonical envelope. Its structured hunks are what
+  // get applied. If it carries a non-empty error, ApplyPatch refuses rather than
+  // treating a failed upstream step as a no-op.
   Patch patch = 2;
+  // The patch to apply, as unified-diff text — the scalar alternative to `patch`.
+  //
+  // Supply exactly one of `patch` or `unified_diff`. This field exists because a
+  // flow edge can currently carry only scalar leaves, so `patch` (a nested
+  // message) cannot be routed from one node to another inside a flow; wiring
+  // Diff.unified_diff into this field composes the chain with a scalar hop.
+  // The text is parsed with the same strict reader ParseUnifiedDiff uses.
+  //
+  // Explicitly optional so that "field absent" is distinguishable from "empty
+  // diff". A diff of two identical texts is legitimately the empty string, and
+  // treating that as "no patch supplied" would break the compose path for
+  // exactly the inputs where nothing needs to change.
+  optional string unified_diff = 3;
 }
 
 // The result of applying a Patch to a text.

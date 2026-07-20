@@ -2,7 +2,7 @@ import { applyPatch } from './apply_patch';
 import { diff } from './diff';
 import { Hunk, Patch, PatchApplyRequest, TextPair } from '../gen/messages_pb';
 import { ctx, CORPUS } from './testkit';
-import { MAX_CHARS, MAX_LINES } from './lib';
+import { MAX_CHARS, MAX_LINES, MAX_PATCH_LINES } from './lib';
 
 const ORIGINAL = 'line1\nline2\nline3\nline4\nline5';
 const REVISED = 'line1\nline2\nCHANGED\nline4\nline5';
@@ -56,10 +56,65 @@ describe('ApplyPatch', () => {
     }
   });
 
-  it('treats an empty patch as a no-op', () => {
-    const out = apply(ORIGINAL, new Patch());
+  it('treats a patch marked identical as a no-op', () => {
+    const p = new Patch();
+    p.setIdentical(true);
+    const out = apply(ORIGINAL, p);
     expect(out.getApplied()).toBe(true);
     expect(out.getText()).toBe(ORIGINAL);
+  });
+
+  // A hunk-less patch that nobody marked identical is malformed, not a no-op.
+  // Applying it as an identity hands the caller back their unchanged text as
+  // though the edit had landed.
+  it('ERROR PATH: refuses a hunk-less patch that is not marked identical', () => {
+    const out = apply(ORIGINAL, new Patch());
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('no hunks and is not marked identical');
+    expect(out.getText()).toBe('');
+  });
+
+  // An upstream failure must never read as a successful identity apply: Diff and
+  // ParseUnifiedDiff report failure as a Patch with error set and no hunks.
+  it('ERROR PATH: refuses a patch carrying an upstream error', () => {
+    const p = new Patch();
+    p.setError('unified_diff is not in unified-diff format');
+    const out = apply(ORIGINAL, p);
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('upstream error');
+    expect(out.getText()).toBe('');
+  });
+
+  it('ERROR PATH: refuses a request that supplies neither patch nor unified_diff', () => {
+    const req = new PatchApplyRequest();
+    req.setOriginal(ORIGINAL);
+    const out = applyPatch(ctx, req);
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('no patch supplied');
+  });
+
+  it('ERROR PATH: refuses a request that supplies both patch and unified_diff', () => {
+    const req = new PatchApplyRequest();
+    req.setOriginal(ORIGINAL);
+    req.setPatch(makeDiff(ORIGINAL, REVISED));
+    req.setUnifiedDiff(makeDiff(ORIGINAL, REVISED).getUnifiedDiff());
+    const out = applyPatch(ctx, req);
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('not both');
+  });
+
+  // The scalar compose path: a flow edge can carry only scalar leaves, so this
+  // is how Diff -> ApplyPatch is wired inside a flow.
+  it('COMPOSE: applies a patch supplied as unified-diff text, matching the envelope path', () => {
+    for (const [original, revised] of CORPUS) {
+      const label = JSON.stringify([original, revised]);
+      const req = new PatchApplyRequest();
+      req.setOriginal(original);
+      req.setUnifiedDiff(makeDiff(original, revised).getUnifiedDiff());
+      const out = applyPatch(ctx, req);
+      expect([label, out.getApplied(), out.getError()]).toEqual([label, true, '']);
+      expect([label, out.getText()]).toEqual([label, revised]);
+    }
   });
 
   it('ERROR PATH: refuses a patch whose context does not match, without corrupting the text', () => {
@@ -130,22 +185,29 @@ describe('ApplyPatch', () => {
 
   it('COMPAT: the unified diff Diff emits is accepted by the system `git apply`', () => {
     // Backs the "standard, git-apply-compatible unified diff" claim with a real
-    // external oracle rather than a self-check. Skips only if git is unavailable.
+    // external oracle rather than a self-check.
+    //
+    // This test must FAIL, not silently pass, when git is missing: an oracle
+    // that disappears with a green tick is indistinguishable in the suite output
+    // from one that ran and proved something, which is exactly how an unbacked
+    // claim survives review. It also drives the FULL corpus (CRLF, Unicode,
+    // empty sides, trailing-newline edges) rather than three hand-picked pairs,
+    // and does NOT pass --unidiff-zero, which would relax git's own context
+    // checking and weaken the oracle it is here to be.
     const { execFileSync } = require('child_process') as typeof import('child_process');
     const fs = require('fs') as typeof import('fs');
     const os = require('os') as typeof import('os');
     const path = require('path') as typeof import('path');
-    try {
-      execFileSync('git', ['--version'], { stdio: 'ignore' });
-    } catch {
-      return; // git not present in this environment — nothing to assert
-    }
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
 
-    for (const [original, revised] of [
-      [ORIGINAL, REVISED],
-      ['a\nb\nc\nd\ne\nf\ng', 'a\nX\nc\nd\nY\nf\ng'],
-      ['only line', 'only line changed'],
-    ] as const) {
+    for (const [original, revised] of CORPUS) {
+      // git apply cannot represent a change to a file with no content on either
+      // side as an in-tree patch of an existing file; those are covered by the
+      // round-trip and ParseUnifiedDiff tests instead.
+      if (original === '' || revised === '') continue;
+      // Identical texts produce an empty diff, which git rightly refuses as
+      // "No valid patches in input" — there is nothing for the oracle to check.
+      if (original === revised) continue;
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'diff-tools-gitapply-'));
       try {
         execFileSync('git', ['init', '-q'], { cwd: dir });
@@ -162,7 +224,7 @@ describe('ApplyPatch', () => {
         input.setRevisedName('b/f.txt');
         const unified = diff(ctx, input).getUnifiedDiff();
 
-        execFileSync('git', ['apply', '--unidiff-zero', '-'], { cwd: dir, input: unified });
+        execFileSync('git', ['apply', '-'], { cwd: dir, input: unified });
         expect([original, revised, fs.readFileSync(path.join(dir, 'f.txt'), 'utf8')]).toEqual([
           original,
           revised,
@@ -177,8 +239,55 @@ describe('ApplyPatch', () => {
   it('ERROR PATH: rejects a hunk pointing far past the end of the text', () => {
     const out = apply(ORIGINAL, hunk({ oldStart: 9999, newStart: 9999 }, ['-nope', '+nah']));
     expect(out.getApplied()).toBe(false);
-    expect(out.getError()).not.toBe('');
+    expect(out.getError()).toContain('starts past the end of the text');
     expect(out.getText()).toBe('');
+  });
+
+  // DoS regression. jsdiff locates a hunk by scanning outward from the declared
+  // start, so cost is linear in the START MAGNITUDE — a ~150-byte patch with
+  // oldStart INT32_MAX burned ~30s of CPU and blew the platform deadline. The
+  // char, line, and patch-body caps all fail to constrain it. A small start
+  // (the previous test's 9999) returns instantly and cannot detect this, so the
+  // bound is asserted here at INT32_MAX *and* timed: the point is that we refuse
+  // without ever handing the value to the applier.
+  it('BOUNDS: rejects an INT32_MAX hunk start immediately rather than scanning to it', () => {
+    const started = Date.now();
+    const out = apply(
+      ORIGINAL,
+      hunk({ oldStart: 2147483647, oldLines: 1, newStart: 2147483647, newLines: 1 }, ['-nope', '+nah']),
+    );
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('starts past the end of the text');
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  // The validator and jsdiff's applier must agree about the same bytes. jsdiff
+  // resolves a bare "" body line to a context line (hunkLine[0] is undefined, so
+  // the operation defaults to " "); counting it as neither side made ApplyPatch
+  // ACCEPT hunks whose header understated their reach and REJECT honest headers.
+  // Real diffs carry bare blank context lines whenever trailing whitespace is
+  // stripped in transit (git send-email, mailing lists, editors).
+  it('SECURITY: counts a bare empty body line as context, agreeing with the applier', () => {
+    const original = 'a\n\n\nb\n';
+
+    // The honest header for this body must be ACCEPTED.
+    const honest = apply(original, hunk({ oldStart: 1, oldLines: 4, newStart: 1, newLines: 4 }, [' a', '', '', '-b', '+B']));
+    expect(honest.getError()).toBe('');
+    expect(honest.getApplied()).toBe(true);
+    expect(honest.getText()).toBe('a\n\n\nB\n');
+
+    // A header that lies about its reach must be REFUSED — previously this was
+    // accepted and silently consumed 3 old lines while declaring 1.
+    const lying = apply(original, hunk({ oldStart: 1, oldLines: 1, newStart: 1, newLines: 2 }, [' a', '', '', '+INJECTED']));
+    expect(lying.getApplied()).toBe(false);
+    expect(lying.getError()).toContain('does not match its body');
+    expect(lying.getText()).toBe('');
+  });
+
+  it('SECURITY: rejects a "\\" body line that is not the end-of-file marker', () => {
+    const out = apply(ORIGINAL, hunk({ oldLines: 5, newLines: 5 }, [' line1', ' line2', '-line3', '+CHANGED', ' line4', ' line5', '\\ arbitrary payload']));
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('is not "\\\\ No newline at end of file"');
   });
 
   it('BOUNDS: rejects an oversized original and an oversized patch', () => {
@@ -186,11 +295,31 @@ describe('ApplyPatch', () => {
     expect(big.getApplied()).toBe(false);
     expect(big.getError()).toContain('original exceeds the maximum');
 
-    const manyLines = Array.from({ length: MAX_LINES + 1 }, (_, i) => `+line ${i}`);
-    const wide = apply(ORIGINAL, hunk({}, manyLines));
+    const manyLines = Array.from({ length: MAX_PATCH_LINES + 1 }, (_, i) => `+line ${i}`);
+    const wide = apply(ORIGINAL, hunk({ newLines: MAX_PATCH_LINES + 1 }, manyLines));
     expect(wide.getApplied()).toBe(false);
-    expect(wide.getError()).toContain(`span more than ${MAX_LINES} lines`);
+    expect(wide.getError()).toContain(`span more than ${MAX_PATCH_LINES} lines`);
   });
+
+  // The patch budget must admit any patch Diff itself can emit, or the headline
+  // round-trip guarantee breaks on input the package accepted without error.
+  // A full rewrite is the worst case: every line appears once as "-", once as "+".
+  it('BOUNDS: a full rewrite at the line cap still round-trips through ApplyPatch', () => {
+    const n = MAX_LINES;
+    const original = Array.from({ length: n }, (_, i) => `alpha-${i}`).join('\n') + '\n';
+    const revised = Array.from({ length: n }, (_, i) => `beta-${i}`).join('\n') + '\n';
+
+    const patch = makeDiff(original, revised);
+    expect(patch.getError()).toBe('');
+    // Guard the premise: this really is a patch bigger than the input line cap.
+    const body = patch.getHunksList().reduce((s, h) => s + h.getLinesList().length, 0);
+    expect(body).toBeGreaterThan(MAX_LINES);
+
+    const out = apply(original, patch);
+    expect(out.getError()).toBe('');
+    expect(out.getApplied()).toBe(true);
+    expect(out.getText()).toBe(revised);
+  }, 60_000);
 
   it('is deterministic across repeated invocations', () => {
     const patch = makeDiff(ORIGINAL, REVISED);

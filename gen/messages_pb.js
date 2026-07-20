@@ -1378,7 +1378,8 @@ proto.christiangeorgelucas.diff_tools.PatchApplyRequest.prototype.toObject = fun
 proto.christiangeorgelucas.diff_tools.PatchApplyRequest.toObject = function(includeInstance, msg) {
   var f, obj = {
 original: jspb.Message.getFieldWithDefault(msg, 1, ""),
-patch: (f = msg.getPatch()) && proto.christiangeorgelucas.diff_tools.Patch.toObject(includeInstance, f)
+patch: (f = msg.getPatch()) && proto.christiangeorgelucas.diff_tools.Patch.toObject(includeInstance, f),
+unifiedDiff: (f = jspb.Message.getField(msg, 3)) == null ? undefined : f
   };
 
   if (includeInstance) {
@@ -1424,6 +1425,10 @@ proto.christiangeorgelucas.diff_tools.PatchApplyRequest.deserializeBinaryFromRea
       reader.readMessage(value,proto.christiangeorgelucas.diff_tools.Patch.deserializeBinaryFromReader);
       msg.setPatch(value);
       break;
+    case 3:
+      var value = /** @type {string} */ (reader.readString());
+      msg.setUnifiedDiff(value);
+      break;
     default:
       reader.skipField();
       break;
@@ -1466,6 +1471,13 @@ proto.christiangeorgelucas.diff_tools.PatchApplyRequest.serializeBinaryToWriter 
       2,
       f,
       proto.christiangeorgelucas.diff_tools.Patch.serializeBinaryToWriter
+    );
+  }
+  f = /** @type {string} */ (jspb.Message.getField(message, 3));
+  if (f != null) {
+    writer.writeString(
+      3,
+      f
     );
   }
 };
@@ -1523,6 +1535,42 @@ proto.christiangeorgelucas.diff_tools.PatchApplyRequest.prototype.clearPatch = f
  */
 proto.christiangeorgelucas.diff_tools.PatchApplyRequest.prototype.hasPatch = function() {
   return jspb.Message.getField(this, 2) != null;
+};
+
+
+/**
+ * optional string unified_diff = 3;
+ * @return {string}
+ */
+proto.christiangeorgelucas.diff_tools.PatchApplyRequest.prototype.getUnifiedDiff = function() {
+  return /** @type {string} */ (jspb.Message.getFieldWithDefault(this, 3, ""));
+};
+
+
+/**
+ * @param {string} value
+ * @return {!proto.christiangeorgelucas.diff_tools.PatchApplyRequest} returns this
+ */
+proto.christiangeorgelucas.diff_tools.PatchApplyRequest.prototype.setUnifiedDiff = function(value) {
+  return jspb.Message.setField(this, 3, value);
+};
+
+
+/**
+ * Clears the field making it undefined.
+ * @return {!proto.christiangeorgelucas.diff_tools.PatchApplyRequest} returns this
+ */
+proto.christiangeorgelucas.diff_tools.PatchApplyRequest.prototype.clearUnifiedDiff = function() {
+  return jspb.Message.setField(this, 3, undefined);
+};
+
+
+/**
+ * Returns whether this field is set.
+ * @return {boolean}
+ */
+proto.christiangeorgelucas.diff_tools.PatchApplyRequest.prototype.hasUnifiedDiff = function() {
+  return jspb.Message.getField(this, 3) != null;
 };
 
 

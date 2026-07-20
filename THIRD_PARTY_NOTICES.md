@@ -7,6 +7,14 @@ Apache-2.0 dual license). There is **no** GPL/AGPL/LGPL/MPL/EPL/CDDL anywhere in
 the tree. The tree was resolved and audited from `package-lock.json` and the
 installed `LICENSE`/`COPYING` files, not from registry metadata alone.
 
+This file covers the **runtime** tree only — the dependencies that ship in the
+built artifact. `devDependencies` (the jest / ts-jest / typescript / babel build
+toolchain) are build-time only and are never distributed, so they require no
+notice here. That exclusion is deliberate, not an omission: the dev-only tree
+does contain two non-standard-but-permissive licenses a future audit will
+otherwise flag — `caniuse-lite` (CC-BY-4.0, via browserslist/babel) and
+`type-fest` (MIT OR CC0-1.0) — and neither reaches the artifact.
+
 ## The library this package wraps
 
 The one dependency this package's own code imports is **`diff` (jsdiff) 8.0.2,

@@ -14,12 +14,34 @@ export const MAX_CHARS = 1_000_000;
  * Maximum lines accepted for any single text or unified-diff input.
  *
  * The diff is O(N*D), so cost peaks when two texts of N lines share nothing.
- * Measured on this library, that worst case runs roughly 0.1s at 1,000 lines and
- * ~2.5-3.5s at 5,000 (the upper end when the lines are long enough to also
- * saturate the character cap), versus ~44s at 20,000 — so the cap is what keeps
- * a hostile input from becoming a denial of service, not a stylistic limit.
+ * Measured against the deployed nodes, that worst case runs roughly 2.0s at
+ * 2,000 lines, 5.8s at 4,000, and ~7-8s at the 5,000-line cap (Diff, Similarity
+ * and Stats all sit in that band, since they pay the same O(N*D)). Cost scales
+ * superlinearly, reaching ~44s at 20,000 lines — so the cap is what keeps a
+ * hostile input from becoming a denial of service, not a stylistic limit.
+ *
+ * Note the cap bounds LINES, not the N*D product that actually drives cost, so
+ * the worst case here is genuinely the worst case: minimal-length wholly
+ * dissimilar lines maximise line count per byte, which is why a ~30KB body can
+ * buy several seconds of CPU.
  */
 export const MAX_LINES = 5_000;
+
+/**
+ * Maximum body lines accepted across all hunks of a single patch.
+ *
+ * This is deliberately derived from MAX_LINES rather than set independently:
+ * a patch body carries BOTH sides, so rewriting every line of an N-line text
+ * yields ~2N body lines (each line once as "-", once as "+"), plus at most one
+ * end-of-file marker per side. Capping the body at MAX_LINES made ApplyPatch
+ * refuse patches that Diff had just emitted without error — the round-trip
+ * guarantee broke at ~2,500 changed lines, well inside the input caps. The
+ * budget must therefore admit any patch Diff itself can produce.
+ */
+export const MAX_PATCH_LINES = 2 * MAX_LINES + 2;
+
+/** The only legal "\" body line in a unified diff. */
+export const NO_NEWLINE_MARKER = '\\ No newline at end of file';
 
 /** Context lines used when TextPair.context_lines is 0. */
 export const DEFAULT_CONTEXT = 3;
@@ -100,6 +122,17 @@ export function nameOr(name: string, fallback: string): string {
   if (name && /[\n\r]/.test(name)) {
     throw new BadInput('original_name / revised_name must not contain a line break');
   }
+  // Beyond the line breaks that could forge diff structure, no control character
+  // or Unicode line/paragraph separator belongs in a path field. None of these
+  // terminate a line for jsdiff or `git apply` (both split on "\n" only), so
+  // they cannot forge a header — but they survive verbatim into the "--- "/"+++ "
+  // position, where NUL, VT, FF and the C1 range corrupt terminals and logs and
+  // break downstream tools that treat the header as a filename.
+  if (name && /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(name)) {
+    throw new BadInput(
+      'original_name / revised_name must not contain control characters or line separators',
+    );
+  }
   return name ? name : fallback;
 }
 
@@ -146,12 +179,12 @@ export function toProtoHunks(hunks: StructuredPatch['hunks']): Hunk[] {
  * than guessed at — jsdiff itself is permissive here and would otherwise
  * silently misapply or refuse without explanation.
  */
-export function fromProtoHunks(hunks: Hunk[]): StructuredPatch['hunks'] {
+export function fromProtoHunks(hunks: Hunk[], originalLines: number): StructuredPatch['hunks'] {
   let totalLines = 0;
   for (const h of hunks) totalLines += h.getLinesList().length;
-  if (totalLines > MAX_LINES) {
+  if (totalLines > MAX_PATCH_LINES) {
     throw new BadInput(
-      `patch hunks span more than ${MAX_LINES} lines in total (got ${totalLines})`,
+      `patch hunks span more than ${MAX_PATCH_LINES} lines in total (got ${totalLines})`,
     );
   }
 
@@ -174,11 +207,27 @@ export function fromProtoHunks(hunks: Hunk[]): StructuredPatch['hunks'] {
     if (oldLines < 0 || newLines < 0) {
       throw new BadInput(`hunk ${i} has a negative line count`);
     }
+    // A start line beyond the end of the text is not merely wrong, it is a
+    // denial of service: jsdiff locates a hunk by scanning linearly outward from
+    // the declared start, so the cost is linear in the START MAGNITUDE and is
+    // bounded by nothing else here. The line and body caps do not constrain it —
+    // a ~150-byte patch declaring oldStart 2147483647 pins a core for ~30s.
+    // The applier is given the original, so the only sane bound is knowable:
+    // a hunk cannot legitimately begin past one line after the text ends.
+    const maxStart = originalLines + 1;
+    if (oldStart > maxStart || newStart > maxStart) {
+      throw new BadInput(
+        `hunk ${i} starts past the end of the text ` +
+          `(old_start=${oldStart}, new_start=${newStart}, text has ${originalLines} lines)`,
+      );
+    }
 
     const lines = h.getLinesList();
     let oldBody = 0; // lines the hunk consumes from the original: context + removed
     let newBody = 0; // lines the hunk produces in the revised text: context + added
-    for (const line of lines) {
+    let markers = 0; // "\ No newline at end of file" markers seen in this hunk
+    for (let j = 0; j < lines.length; j++) {
+      const line = lines[j];
       const prefix = line.charAt(0);
       if (line !== '' && prefix !== ' ' && prefix !== '-' && prefix !== '+' && prefix !== '\\') {
         throw new BadInput(
@@ -186,16 +235,54 @@ export function fromProtoHunks(hunks: Hunk[]): StructuredPatch['hunks'] {
             `(expected " ", "-", "+", or "\\")`,
         );
       }
-      if (prefix === ' ') {
-        oldBody++;
-        newBody++;
-      } else if (prefix === '-') {
+      if (prefix === '\\') {
+        // The only legal backslash line is the end-of-file marker. jsdiff keys
+        // its trailing-newline handling off the "\" prefix alone, so an
+        // unchecked marker is both free payload and a way to steer that
+        // behaviour from an arbitrary position in the body.
+        if (line !== NO_NEWLINE_MARKER) {
+          throw new BadInput(
+            `hunk ${i} has a "\\" body line that is not ${JSON.stringify(NO_NEWLINE_MARKER)}`,
+          );
+        }
+        // The marker terminates a RUN, not the hunk: it follows the last line of
+        // whichever side lacks the trailing newline. When only the original side
+        // lacks one, Diff emits it mid-hunk, between the "-" run and the "+" run
+        // — so requiring it to be the hunk's final line would reject patches
+        // this package itself produces. It must still follow a real body line,
+        // and a hunk has at most two sides to terminate.
+        if (j === 0) {
+          throw new BadInput(
+            `hunk ${i} begins with a ${JSON.stringify(NO_NEWLINE_MARKER)} marker`,
+          );
+        }
+        if (lines[j - 1].charAt(0) === '\\') {
+          throw new BadInput(`hunk ${i} has consecutive ${JSON.stringify(NO_NEWLINE_MARKER)} markers`);
+        }
+        markers++;
+        if (markers > 2) {
+          throw new BadInput(
+            `hunk ${i} has more than two ${JSON.stringify(NO_NEWLINE_MARKER)} markers`,
+          );
+        }
+        continue; // the marker itself consumes and produces nothing
+      }
+      if (prefix === '-') {
         oldBody++;
       } else if (prefix === '+') {
         newBody++;
+      } else {
+        // A " "-prefixed line is context. So is a bare "" line: real-world
+        // unified diffs routinely lose the single space on a blank context line
+        // (git send-email, mailing lists, editors that strip trailing
+        // whitespace), and jsdiff's applier resolves an empty body line to a
+        // context line — `hunkLine[0]` is undefined, so its operation defaults
+        // to " ". Counting "" as neither side made this validator disagree with
+        // the applier over the same bytes, which both accepted hunks whose
+        // header understated their true reach and rejected honest headers.
+        oldBody++;
+        newBody++;
       }
-      // A "\" ("No newline at end of file") marker and an empty line count for
-      // neither side.
     }
 
     // The @@ header's declared line counts must match the body the hunk actually
@@ -222,7 +309,23 @@ export function fromProtoHunks(hunks: Hunk[]): StructuredPatch['hunks'] {
   });
 }
 
-/** Extracts the "---" / "+++" header names from unified-diff text, if present. */
+/** The filename portion of a "--- "/"+++ " header line: everything before the tab. */
+function headerName(line: string): string {
+  const rest = line.slice(4);
+  const tab = rest.indexOf('\t');
+  return (tab === -1 ? rest : rest.slice(0, tab)).trim();
+}
+
+/**
+ * Extracts the "---" / "+++" header names from unified-diff text, if present.
+ *
+ * GNU `diff -u` appends a TAB-separated modification timestamp after the
+ * filename ("--- f.txt\t2026-07-19 10:00:00.000000000 +0000"), and git accepts
+ * the same form. The name is the field BEFORE that tab — cutting there is what
+ * git and patch(1) do, and not doing it dragged the timestamp into
+ * original_name/revised_name for every diff produced by the very tool this
+ * node advertises it can read.
+ */
 export function headerNames(unifiedDiff: string): { original: string; revised: string } {
   let original = 'original';
   let revised = 'revised';
@@ -233,11 +336,11 @@ export function headerNames(unifiedDiff: string): { original: string; revised: s
     if (line.startsWith('@@')) break;
     if (!sawOriginal && line.startsWith('--- ')) {
       sawOriginal = true;
-      const v = line.slice(4).trim();
+      const v = headerName(line);
       if (v) original = v;
     } else if (!sawRevised && line.startsWith('+++ ')) {
       sawRevised = true;
-      const v = line.slice(4).trim();
+      const v = headerName(line);
       if (v) revised = v;
     }
   }

@@ -172,6 +172,11 @@ export class PatchApplyRequest extends jspb.Message {
   getPatch(): Patch | undefined;
   setPatch(value?: Patch): void;
 
+  hasUnifiedDiff(): boolean;
+  clearUnifiedDiff(): void;
+  getUnifiedDiff(): string;
+  setUnifiedDiff(value: string): void;
+
   serializeBinary(): Uint8Array;
   toObject(includeInstance?: boolean): PatchApplyRequest.AsObject;
   static toObject(includeInstance: boolean, msg: PatchApplyRequest): PatchApplyRequest.AsObject;
@@ -186,6 +191,7 @@ export namespace PatchApplyRequest {
   export type AsObject = {
     original: string,
     patch?: Patch.AsObject,
+    unifiedDiff: string,
   }
 }
 

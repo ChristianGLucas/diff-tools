@@ -17,12 +17,28 @@ Diff             -> Patch -> ApplyPatch      # reproduces the revised text exact
 ParseUnifiedDiff -> Patch -> ApplyPatch      # applies a diff produced anywhere
 ```
 
+**Composing inside a flow.** A flow edge currently carries only *scalar* leaves,
+so the nested `Patch` message cannot be routed across one — attempting it fails
+at run time with `encoding kind KIND_MESSAGE not implemented`, after compiling
+green. `ApplyPatch` therefore also accepts the diff as **text**, via its scalar
+`unified_diff` input, which is how the chain is wired in a flow:
+
+```
+Diff.unified_diff -> ApplyPatch.unified_diff   # scalar hop, parsed strictly
+```
+
+Note that `ApplyPatch` needs the *original* text too, and a `Patch` does not
+carry it — a patch describes a change, not the thing it changes — so `original`
+is threaded from the flow's own input. Both shapes are shown in
+[`flows/`](flows/): `diff-roundtrip.flow.yaml` (Diff → ParseUnifiedDiff) and
+`diff-apply.flow.yaml` (Diff → ApplyPatch, the round trip end to end).
+
 ## Nodes
 
 | Node | In → Out | What it does |
 |---|---|---|
 | `Diff` | `TextPair` → `Patch` | Line diff of two texts, as unified-diff text **and** structured hunks. |
-| `ApplyPatch` | `PatchApplyRequest` → `PatchApplyResult` | Applies a patch to a text. Exact matching — never fuzzy, never partial. |
+| `ApplyPatch` | `PatchApplyRequest` → `PatchApplyResult` | Applies a patch — as a `Patch` envelope or as unified-diff text — to a text. Exact matching, never fuzzy, never partial. |
 | `ParseUnifiedDiff` | `UnifiedDiffText` → `Patch` | Parses a unified diff from git, `diff -u`, or another agent. |
 | `Similarity` | `Texts` → `SimilarityScore` | Line-level similarity in `[0.0, 1.0]`, plus the raw line counts. |
 | `Stats` | `Texts` → `DiffStats` | Lines added/deleted and changed-block count, `git diff --shortstat` style. |
@@ -31,7 +47,9 @@ ParseUnifiedDiff -> Patch -> ApplyPatch      # applies a diff produced anywhere
 
 - **Exact round trip.** `ApplyPatch(original, Diff(original, revised))` reproduces
   `revised` byte for byte — trailing newlines, CRLF endings, and Unicode all
-  survive. Enforced by a test over a corpus of newline and encoding edge cases.
+  survive. Enforced by a test over a corpus of newline and encoding edge cases,
+  and by a full-rewrite round trip **at the 5,000-line cap**, so the guarantee is
+  proven at the scale where the caps interact rather than only on short inputs.
 - **Standard, apply-compatible format.** `unified_diff` is a valid, minimal
   unified diff (`---`/`+++`/`@@` hunks, including the `\ No newline at end of
   file` marker); the system `git apply` accepts it (checked by a differential
@@ -45,11 +63,20 @@ ParseUnifiedDiff -> Patch -> ApplyPatch      # applies a diff produced anywhere
 - **Strict, not permissive.** Prose that merely *talks about* a change is
   rejected rather than silently reported as "no changes"; a malformed `@@` header
   is an error, not a null-numbered hunk; a patch whose context does not match is
-  refused rather than fuzzy-matched; and a header name containing a line break —
-  which could forge extra diff headers — is rejected.
+  refused rather than fuzzy-matched; and a header name containing a line break,
+  control character, or Unicode line separator — which could forge extra diff
+  headers or corrupt a downstream consumer — is rejected. A patch that arrives
+  carrying an upstream `error`, or with no hunks and not marked `identical`, is
+  refused rather than applied as a silent no-op: a failed step upstream must not
+  read as a successful identity.
 - **Bounded cost.** Inputs are capped at 1,000,000 characters and 5,000 lines per
-  text. The diff is O(N·D), so two wholly-dissimilar texts are the worst case;
-  the cap holds that under ~3.5s instead of the ~44s that 20,000 lines would take.
+  text, and a patch body at 10,002 lines — twice the line cap, so any patch `Diff`
+  can emit is one `ApplyPatch` will accept. The diff is O(N·D), so two
+  wholly-dissimilar texts are the worst case: measured at roughly 2.0s at 2,000
+  lines and **~7-8s at the 5,000-line cap**, versus the ~44s that 20,000 lines
+  would take. Hunk start lines are bounded by the text being patched, because the
+  applier locates a hunk by scanning outward from the declared start — an
+  unbounded start is a denial of service that no size cap constrains.
 - **Deterministic and offline.** No network, no state, no secrets, no clock.
 
 ### Line model
@@ -58,6 +85,24 @@ An empty text is zero lines, and a trailing newline closes the final line rather
 than adding an empty one — `"a\nb"` and `"a\nb\n"` are both two lines. A line
 carries its terminator, so `"b"` and `"b\n"` are *not* the same line: adding or
 removing a trailing newline is a real change, and every node reports it as one.
+
+## Errors
+
+Failures come back in one of two shapes, and the difference is worth knowing:
+
+- **Semantic failures** — anything this package decides to reject (a context
+  mismatch, prose instead of a diff, an out-of-range `context_lines`, a bound
+  exceeded) — return a **success status with an in-band `error` field** set on
+  the output message, and the other fields zeroed. Every node uses this contract,
+  with stable wording. `ApplyPatch` additionally sets `applied: false`, and never
+  returns a half-patched text: on any failure `text` is empty.
+- **Schema failures** — input that does not match the message type at all (a
+  number where a string belongs) — are rejected by the platform *before* the node
+  runs, and come back as a transport-level **400** in a different shape
+  (`{error_message, execution_id}`).
+
+So a caller checking only the HTTP status will miss every semantic failure:
+check the `error` field.
 
 ## Correctness
 

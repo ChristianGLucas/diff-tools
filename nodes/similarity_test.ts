@@ -1,7 +1,7 @@
 import { similarity } from './similarity';
 import { Texts } from '../gen/messages_pb';
 import { ctx, CORPUS, lcsLength, splitLines } from './testkit';
-import { MAX_CHARS } from './lib';
+import { MAX_CHARS, MAX_LINES } from './lib';
 
 function score(original: string, revised: string) {
   const input = new Texts();
@@ -99,6 +99,20 @@ describe('Similarity', () => {
     expect(out.getRatio()).toBe(0);
     expect(out.getMatchingLines()).toBe(0);
   });
+
+  // Similarity and Stats pay the same O(N*D) cost as Diff and carry the same
+  // "bounded cost" claim, but neither had a timing test — the cap was only ever
+  // asserted for Diff. The worst case is two wholly dissimilar texts at the line
+  // cap. The threshold is generous enough not to flake on a loaded CI box while
+  // still catching a regression that removes the bound entirely.
+  it('BOUNDS: the worst case at the line cap completes in bounded time', () => {
+    const a = Array.from({ length: MAX_LINES }, (_, i) => `alpha ${i}`).join('\n');
+    const b = Array.from({ length: MAX_LINES }, (_, i) => `beta ${i}`).join('\n');
+    const started = Date.now();
+    const out = score(a, b);
+    expect(out.getError()).toBe('');
+    expect(Date.now() - started).toBeLessThan(20_000);
+  }, 60_000);
 
   it('is deterministic across repeated invocations', () => {
     const first = score('a\nb\nc', 'a\nX\nc').getRatio();

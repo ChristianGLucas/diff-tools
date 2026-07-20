@@ -89,6 +89,20 @@ describe('Stats', () => {
     expect(out.getChangedBlocks()).toBe(0);
   });
 
+  // Similarity and Stats pay the same O(N*D) cost as Diff and carry the same
+  // "bounded cost" claim, but neither had a timing test — the cap was only ever
+  // asserted for Diff. The worst case is two wholly dissimilar texts at the line
+  // cap. The threshold is generous enough not to flake on a loaded CI box while
+  // still catching a regression that removes the bound entirely.
+  it('BOUNDS: the worst case at the line cap completes in bounded time', () => {
+    const a = Array.from({ length: MAX_LINES }, (_, i) => `alpha ${i}`).join('\n');
+    const b = Array.from({ length: MAX_LINES }, (_, i) => `beta ${i}`).join('\n');
+    const started = Date.now();
+    const out = count(a, b);
+    expect(out.getError()).toBe('');
+    expect(Date.now() - started).toBeLessThan(20_000);
+  }, 60_000);
+
   it('is deterministic across repeated invocations', () => {
     const first = count('a\nb\nc', 'a\nX\nc').getChangedBlocks();
     for (let i = 0; i < 5; i++) expect(count('a\nb\nc', 'a\nX\nc').getChangedBlocks()).toBe(first);

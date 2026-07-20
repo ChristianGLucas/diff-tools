@@ -118,6 +118,34 @@ describe('ParseUnifiedDiff', () => {
     );
   });
 
+  // GNU `diff -u` appends a TAB-separated timestamp after the filename, and this
+  // node advertises that it reads diffs from `diff -u`. Before the tab-cut, the
+  // timestamp was dragged into original_name/revised_name for every such diff.
+  it('reads a GNU `diff -u` header without dragging the timestamp into the name', () => {
+    const text = [
+      '--- f.txt\t2026-07-19 10:00:00.000000000 +0000',
+      '+++ g.txt\t2026-07-19 10:00:01.000000000 +0000',
+      '@@ -1,1 +1,1 @@',
+      '-a',
+      '+b',
+      '',
+    ].join('\n');
+    const out = parse(text);
+    expect(out.getError()).toBe('');
+    expect(out.getOriginalName()).toBe('f.txt');
+    expect(out.getRevisedName()).toBe('g.txt');
+  });
+
+  // A hostile "@@" header must be refused at parse time, not laundered into a
+  // Patch envelope. jsdiff's applier scans linearly from the declared start, so
+  // a Patch carrying start 2e9 costs ~30s of CPU wherever it is later applied.
+  it('SECURITY: rejects an absurd hunk line number rather than emitting it', () => {
+    const text = ['--- a', '+++ b', '@@ -2000000000,1 +2000000000,1 @@', '-a', '+b', ''].join('\n');
+    const out = parse(text);
+    expect(out.getError()).toContain('beyond the maximum');
+    expect(out.getHunksList()).toHaveLength(0);
+  });
+
   it('is deterministic across repeated invocations', () => {
     const text = ['--- original', '+++ revised', '@@ -1,1 +1,1 @@', '-a', '+b', ''].join('\n');
     const first = parse(text).getHunksList().map((h) => h.getLinesList());

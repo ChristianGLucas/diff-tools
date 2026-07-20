@@ -1,5 +1,5 @@
 name: christiangeorgelucas/diff-tools
-version: 0.2.0
+version: 0.3.0
 language: typescript
 description: >-
   Composable text-diff nodes over a single canonical Patch envelope — compute a
@@ -26,8 +26,11 @@ nodes:
       output: Patch
     - name: ApplyPatch
       description: >-
-        Apply a Patch's structured hunks to a text, exactly — never fuzzy,
-        never partial. A context mismatch is refused rather than misapplied.
+        Apply a patch to a text, exactly — never fuzzy, never partial. Takes
+        either the canonical Patch envelope or the diff as unified-diff text
+        (the scalar form, so the chain composes inside a flow). A context
+        mismatch, or a patch that failed upstream, is refused rather than
+        misapplied or silently treated as a no-op.
       input: PatchApplyRequest
       output: PatchApplyResult
     - name: ParseUnifiedDiff
