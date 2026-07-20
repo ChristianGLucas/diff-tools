@@ -14,9 +14,10 @@ export const MAX_CHARS = 1_000_000;
  * Maximum lines accepted for any single text or unified-diff input.
  *
  * The diff is O(N*D), so cost peaks when two texts of N lines share nothing.
- * Measured on this library, that worst case costs roughly 0.1s at 1,000 lines,
- * 2.4s at 5,000, and 44s at 20,000 — so the cap is what keeps a hostile input
- * from becoming a denial of service, not a stylistic limit.
+ * Measured on this library, that worst case runs roughly 0.1s at 1,000 lines and
+ * ~2.5-3.5s at 5,000 (the upper end when the lines are long enough to also
+ * saturate the character cap), versus ~44s at 20,000 — so the cap is what keeps
+ * a hostile input from becoming a denial of service, not a stylistic limit.
  */
 export const MAX_LINES = 5_000;
 
@@ -84,8 +85,21 @@ export function contextLines(requested: number): number {
   return requested === -1 ? 0 : requested;
 }
 
-/** Returns name if non-empty, else fallback. */
+/**
+ * Returns a header name if non-empty, else the fallback — after rejecting any
+ * name that could forge diff structure.
+ *
+ * original_name/revised_name flow verbatim into the "---"/"+++" header lines of
+ * the emitted unified_diff. A name is a SINGLE header field, so it must not
+ * contain a line break: a newline (or carriage return) in the name would let a
+ * caller inject additional "---"/"+++"/"@@" lines and turn a single-file diff
+ * into a forged multi-file patch that ParseUnifiedDiff or `git apply` would act
+ * on. Reject rather than strip, so the caller learns their name was invalid.
+ */
 export function nameOr(name: string, fallback: string): string {
+  if (name && /[\n\r]/.test(name)) {
+    throw new BadInput('original_name / revised_name must not contain a line break');
+  }
   return name ? name : fallback;
 }
 
@@ -162,6 +176,8 @@ export function fromProtoHunks(hunks: Hunk[]): StructuredPatch['hunks'] {
     }
 
     const lines = h.getLinesList();
+    let oldBody = 0; // lines the hunk consumes from the original: context + removed
+    let newBody = 0; // lines the hunk produces in the revised text: context + added
     for (const line of lines) {
       const prefix = line.charAt(0);
       if (line !== '' && prefix !== ' ' && prefix !== '-' && prefix !== '+' && prefix !== '\\') {
@@ -170,6 +186,27 @@ export function fromProtoHunks(hunks: Hunk[]): StructuredPatch['hunks'] {
             `(expected " ", "-", "+", or "\\")`,
         );
       }
+      if (prefix === ' ') {
+        oldBody++;
+        newBody++;
+      } else if (prefix === '-') {
+        oldBody++;
+      } else if (prefix === '+') {
+        newBody++;
+      }
+      // A "\" ("No newline at end of file") marker and an empty line count for
+      // neither side.
+    }
+
+    // The @@ header's declared line counts must match the body the hunk actually
+    // carries. jsdiff positions by the declared counts but edits by the body, so
+    // a hunk whose header lies about its size would still "apply" — accepting
+    // that would make a Patch's header and body silently disagree. Reject it.
+    if (oldLines !== oldBody || newLines !== newBody) {
+      throw new BadInput(
+        `hunk ${i} header (old_lines=${oldLines}, new_lines=${newLines}) does not match its body ` +
+          `(counted old=${oldBody}, new=${newBody})`,
+      );
     }
 
     // Back to jsdiff's in-memory convention (see toProtoHunks): an empty-side

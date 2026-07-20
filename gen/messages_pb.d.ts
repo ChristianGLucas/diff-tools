@@ -83,6 +83,30 @@ export namespace Patch {
   }
 }
 
+export class Texts extends jspb.Message {
+  getOriginal(): string;
+  setOriginal(value: string): void;
+
+  getRevised(): string;
+  setRevised(value: string): void;
+
+  serializeBinary(): Uint8Array;
+  toObject(includeInstance?: boolean): Texts.AsObject;
+  static toObject(includeInstance: boolean, msg: Texts): Texts.AsObject;
+  static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+  static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+  static serializeBinaryToWriter(message: Texts, writer: jspb.BinaryWriter): void;
+  static deserializeBinary(bytes: Uint8Array): Texts;
+  static deserializeBinaryFromReader(message: Texts, reader: jspb.BinaryReader): Texts;
+}
+
+export namespace Texts {
+  export type AsObject = {
+    original: string,
+    revised: string,
+  }
+}
+
 export class TextPair extends jspb.Message {
   getOriginal(): string;
   setOriginal(value: string): void;

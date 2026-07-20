@@ -108,6 +108,72 @@ describe('ApplyPatch', () => {
     expect(out.getError()).toContain('unknown prefix');
   });
 
+  it('ERROR PATH: rejects a hunk whose declared counts contradict its body', () => {
+    // jsdiff positions by the declared counts but edits by the body, so a lying
+    // header would still "apply". The envelope must not let header and body
+    // disagree — reject it. Body is 1 context + 1 removed + 1 added.
+    const lying = hunk({ oldLines: 99, newLines: 99 }, [' line1', '-line2', '+X']);
+    const out = apply(ORIGINAL, lying);
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('does not match its body');
+    expect(out.getText()).toBe('');
+
+    // The honest counts for that same body (old = context+removed = 2,
+    // new = context+added = 2) are accepted.
+    const honest = hunk({ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2 }, [
+      ' line1',
+      '-line2',
+      '+X',
+    ]);
+    expect(apply(ORIGINAL, honest).getError()).toBe('');
+  });
+
+  it('COMPAT: the unified diff Diff emits is accepted by the system `git apply`', () => {
+    // Backs the "standard, git-apply-compatible unified diff" claim with a real
+    // external oracle rather than a self-check. Skips only if git is unavailable.
+    const { execFileSync } = require('child_process') as typeof import('child_process');
+    const fs = require('fs') as typeof import('fs');
+    const os = require('os') as typeof import('os');
+    const path = require('path') as typeof import('path');
+    try {
+      execFileSync('git', ['--version'], { stdio: 'ignore' });
+    } catch {
+      return; // git not present in this environment — nothing to assert
+    }
+
+    for (const [original, revised] of [
+      [ORIGINAL, REVISED],
+      ['a\nb\nc\nd\ne\nf\ng', 'a\nX\nc\nd\nY\nf\ng'],
+      ['only line', 'only line changed'],
+    ] as const) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'diff-tools-gitapply-'));
+      try {
+        execFileSync('git', ['init', '-q'], { cwd: dir });
+        execFileSync('git', ['config', 'user.email', 't@t'], { cwd: dir });
+        execFileSync('git', ['config', 'user.name', 't'], { cwd: dir });
+        fs.writeFileSync(path.join(dir, 'f.txt'), original);
+        execFileSync('git', ['add', 'f.txt'], { cwd: dir });
+        execFileSync('git', ['commit', '-qm', 'base'], { cwd: dir });
+
+        const input = new TextPair();
+        input.setOriginal(original);
+        input.setRevised(revised);
+        input.setOriginalName('a/f.txt');
+        input.setRevisedName('b/f.txt');
+        const unified = diff(ctx, input).getUnifiedDiff();
+
+        execFileSync('git', ['apply', '--unidiff-zero', '-'], { cwd: dir, input: unified });
+        expect([original, revised, fs.readFileSync(path.join(dir, 'f.txt'), 'utf8')]).toEqual([
+          original,
+          revised,
+          revised,
+        ]);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('ERROR PATH: rejects a hunk pointing far past the end of the text', () => {
     const out = apply(ORIGINAL, hunk({ oldStart: 9999, newStart: 9999 }, ['-nope', '+nah']));
     expect(out.getApplied()).toBe(false);

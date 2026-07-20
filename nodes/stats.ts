@@ -1,4 +1,4 @@
-import { TextPair, DiffStats } from '../gen/messages_pb';
+import { Texts, DiffStats } from '../gen/messages_pb';
 import { AxiomContext } from '../gen/axiomContext';
 import { diffLines } from 'diff';
 import { checkBounds, countLines, errorMessage } from './lib';
@@ -25,7 +25,7 @@ import { checkBounds, countLines, errorMessage } from './lib';
  *
  * @param ax - Platform context: ax.log for logging, ax.secrets for secrets.
  */
-export function stats(ax: AxiomContext, input: TextPair): DiffStats {
+export function stats(ax: AxiomContext, input: Texts): DiffStats {
   try {
     const original = input.getOriginal() || '';
     const revised = input.getRevised() || '';

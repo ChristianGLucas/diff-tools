@@ -1,0 +1,17 @@
+name: diff-roundtrip
+description: Diff two texts, then re-parse the emitted unified diff back into the canonical Patch envelope — proves diff-tools' Patch envelope composes and that the diff it emits is genuinely re-parseable.
+
+nodes:
+  - alias: make_diff
+    package: christiangeorgelucas/diff-tools@0.1.0
+    node: Diff
+  - alias: reparse
+    package: christiangeorgelucas/diff-tools@0.1.0
+    node: ParseUnifiedDiff
+
+edges:
+  - from: make_diff
+    to: reparse
+    adapter:
+      # Diff emits unified-diff text; ParseUnifiedDiff consumes it.
+      "unified_diff": unified_diff

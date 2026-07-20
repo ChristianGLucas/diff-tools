@@ -11,11 +11,13 @@ import {
 } from './lib';
 
 /**
- * Compute the line-level difference between two texts, returned both as
- * standard unified-diff text and as structured hunks in one canonical Patch
- * envelope. The unified_diff field is byte-for-byte what GNU `diff -u` emits,
- * including the "\ No newline at end of file" marker, so it can be piped
- * straight to `git apply` or `patch`.
+ * Compute the line-level difference between two texts, returned both as a
+ * standard unified diff and as structured hunks in one canonical Patch envelope.
+ * The unified_diff field is a valid, minimal unified diff (---/+++/@@ hunks,
+ * including the "\ No newline at end of file" marker). It is standard-conformant
+ * and re-parseable by ParseUnifiedDiff, but not byte-identical to any single
+ * tool: GNU `diff -u` drops the ",1" on single-line ranges and may pick a
+ * different equally-minimal alignment.
  *
  * Feeding the result to ApplyPatch reproduces the revised text exactly — trailing
  * newlines, CRLF line endings, and Unicode all round-trip unchanged. When the two
@@ -23,9 +25,11 @@ import {
  *
  * context_lines controls the unchanged lines shown around each hunk: 0 selects
  * the default of 3, and -1 means no context at all. Inputs above 1,000,000
- * characters or 5,000 lines, and context_lines outside -1..100, are rejected
- * with a structured error rather than a crash — the line bound is what keeps a
- * hostile pair of wholly-dissimilar texts from becoming a denial of service.
+ * characters or 5,000 lines, context_lines outside -1..100, and an
+ * original_name/revised_name containing a line break (which could forge extra
+ * diff headers) are all rejected with a structured error rather than a crash —
+ * the line bound is what keeps a hostile pair of wholly-dissimilar texts from
+ * becoming a denial of service.
  *
  * Deterministic and fully offline.
  *

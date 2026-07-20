@@ -1,4 +1,4 @@
-import { TextPair, SimilarityScore } from '../gen/messages_pb';
+import { Texts, SimilarityScore } from '../gen/messages_pb';
 import { AxiomContext } from '../gen/axiomContext';
 import { diffLines } from 'diff';
 import { checkBounds, countLines, errorMessage } from './lib';
@@ -24,7 +24,7 @@ import { checkBounds, countLines, errorMessage } from './lib';
  *
  * @param ax - Platform context: ax.log for logging, ax.secrets for secrets.
  */
-export function similarity(ax: AxiomContext, input: TextPair): SimilarityScore {
+export function similarity(ax: AxiomContext, input: Texts): SimilarityScore {
   try {
     const original = input.getOriginal() || '';
     const revised = input.getRevised() || '';

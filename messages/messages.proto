@@ -32,8 +32,11 @@ message Hunk {
 // as unified-diff text and as structured hunks. Emitted by Diff and
 // ParseUnifiedDiff; consumed by ApplyPatch.
 message Patch {
-  // The change in standard unified-diff format (---/+++/@@ hunks), byte-for-byte
-  // what GNU `diff -u` emits. Empty when the two texts are identical.
+  // The change in standard unified-diff format (---/+++/@@ hunks): a valid,
+  // minimal unified diff that ApplyPatch and ParseUnifiedDiff round-trip
+  // exactly. (It is standard-conformant but not byte-identical to any one tool —
+  // GNU diff drops the ",1" on single-line ranges and may pick a different
+  // equally-minimal alignment.) Empty when the two texts are identical.
   string unified_diff = 1;
   // The same change as structured hunks, in original-text order.
   repeated Hunk hunks = 2;
@@ -48,7 +51,17 @@ message Patch {
   string error = 6;
 }
 
-// Two texts to compare, line by line.
+// Two texts to compare, for the analysis nodes (Similarity, Stats) that only
+// need the content — no diff-formatting options.
+message Texts {
+  // The original ("before") text.
+  string original = 1;
+  // The revised ("after") text.
+  string revised = 2;
+}
+
+// Two texts to compare, plus the options that shape a generated unified diff.
+// Consumed by Diff.
 message TextPair {
   // The original ("before") text.
   string original = 1;

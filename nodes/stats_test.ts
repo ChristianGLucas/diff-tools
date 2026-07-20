@@ -1,10 +1,10 @@
 import { stats } from './stats';
-import { TextPair } from '../gen/messages_pb';
+import { Texts } from '../gen/messages_pb';
 import { ctx, CORPUS, lcsLength, splitLines } from './testkit';
 import { MAX_LINES } from './lib';
 
 function count(original: string, revised: string) {
-  const input = new TextPair();
+  const input = new Texts();
   input.setOriginal(original);
   input.setRevised(revised);
   return stats(ctx, input);

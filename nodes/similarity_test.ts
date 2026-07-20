@@ -1,10 +1,10 @@
 import { similarity } from './similarity';
-import { TextPair } from '../gen/messages_pb';
+import { Texts } from '../gen/messages_pb';
 import { ctx, CORPUS, lcsLength, splitLines } from './testkit';
 import { MAX_CHARS } from './lib';
 
 function score(original: string, revised: string) {
-  const input = new TextPair();
+  const input = new Texts();
   input.setOriginal(original);
   input.setRevised(revised);
   return similarity(ctx, input);

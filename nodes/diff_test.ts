@@ -17,11 +17,14 @@ function run(original: string, revised: string, opts: Partial<{ ctxLines: number
 }
 
 describe('Diff', () => {
-  it('GOLDEN: emits the exact unified diff GNU `diff -u` produces', () => {
+  it('GOLDEN: emits a valid, pinned unified diff for a known change', () => {
+    // A deterministic regression anchor. This is a valid, minimal unified diff
+    // (and, for this multi-line-range input, it also happens to match GNU
+    // `diff -u`) — but the package does NOT claim byte-for-byte GNU equivalence
+    // in general; see the round-trip and re-parse tests for the real guarantee.
     const out = run(ORIGINAL, REVISED);
     expect(out.getError()).toBe('');
     expect(out.getIdentical()).toBe(false);
-    // Verified character-for-character against `diff -u` on these two inputs.
     expect(out.getUnifiedDiff()).toBe(
       [
         '--- original',
@@ -151,6 +154,43 @@ describe('Diff', () => {
     expect(out.getHunksList().length).toBeGreaterThan(0);
     expect(Date.now() - started).toBeLessThan(20_000);
   }, 30_000);
+
+  it('SECURITY: rejects a header name containing a line break (forged-header injection)', () => {
+    // A newline in a name would let the caller inject extra "---"/"+++"/"@@"
+    // lines and turn this single-file diff into a forged multi-file patch that
+    // ParseUnifiedDiff or `git apply` would act on. Must be refused.
+    const injected = run(ORIGINAL, REVISED, {
+      on: 'a/real\n+++ b/real\n@@ -1 +1 @@\n-x\n+y\n--- a/victim',
+      rn: 'b/victim',
+    });
+    expect(injected.getError()).toContain('must not contain a line break');
+    expect(injected.getUnifiedDiff()).toBe('');
+    expect(injected.getHunksList()).toHaveLength(0);
+
+    // A carriage return is refused too.
+    expect(run(ORIGINAL, REVISED, { rn: 'b/f\rmalicious' }).getError()).toContain(
+      'must not contain a line break',
+    );
+
+    // A normal, single-line name with slashes is still fine.
+    expect(run(ORIGINAL, REVISED, { on: 'a/app.txt', rn: 'b/app.txt' }).getError()).toBe('');
+  });
+
+  it('SECURITY: the emitted unified_diff describes exactly one file for any accepted input', () => {
+    for (const [original, revised] of CORPUS) {
+      const out = run(original, revised);
+      if (out.getIdentical()) continue;
+      const fileHeaders = out
+        .getUnifiedDiff()
+        .split('\n')
+        .filter((l) => l.startsWith('--- ') || l.startsWith('+++ '));
+      // Exactly one "---" and one "+++" — never a smuggled second file.
+      expect([JSON.stringify([original, revised]), fileHeaders.length]).toEqual([
+        JSON.stringify([original, revised]),
+        2,
+      ]);
+    }
+  });
 
   it('is deterministic across repeated invocations', () => {
     const first = run(ORIGINAL, REVISED).getUnifiedDiff();

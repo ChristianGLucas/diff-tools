@@ -1,19 +1,51 @@
 name: christiangeorgelucas/diff-tools
-version: 0.1.0
+version: 0.2.0
 language: typescript
+description: >-
+  Composable text-diff nodes over a single canonical Patch envelope — compute a
+  line diff as both unified-diff text and structured hunks, parse a unified diff
+  from anywhere, apply a patch back to a text (exact round trip), score line
+  similarity, and count what changed. Offline, deterministic, and bounded,
+  wrapping the BSD-3-Clause jsdiff library.
+license: MIT
+author: Christian George Lucas
+tags:
+  - diff
+  - patch
+  - unified-diff
+  - text
+  - merge
+  - version-control
 nodes:
     - name: Diff
+      description: >-
+        Compute the line diff of two texts, returned as both standard
+        unified-diff text and structured hunks in one Patch envelope. Applying
+        the result with ApplyPatch reproduces the revised text exactly.
       input: TextPair
       output: Patch
     - name: ApplyPatch
+      description: >-
+        Apply a Patch's structured hunks to a text, exactly — never fuzzy,
+        never partial. A context mismatch is refused rather than misapplied.
       input: PatchApplyRequest
       output: PatchApplyResult
     - name: ParseUnifiedDiff
+      description: >-
+        Parse a standard unified diff (from git, diff -u, or another agent) into
+        the canonical Patch envelope so it can be fed to ApplyPatch. Rejects
+        prose and malformed diffs rather than silently reporting no changes.
       input: UnifiedDiffText
       output: Patch
     - name: Similarity
-      input: TextPair
+      description: >-
+        Score how similar two texts are at line granularity, in [0.0, 1.0],
+        with the underlying matching and total line counts.
+      input: Texts
       output: SimilarityScore
     - name: Stats
-      input: TextPair
+      description: >-
+        Count what changed between two texts — lines added, lines deleted, and
+        contiguous changed blocks — git-shortstat style, without the diff itself.
+      input: Texts
       output: DiffStats
