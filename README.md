@@ -27,11 +27,20 @@ green. `ApplyPatch` therefore also accepts the diff as **text**, via its scalar
 Diff.unified_diff -> ApplyPatch.unified_diff   # scalar hop, parsed strictly
 ```
 
-Note that `ApplyPatch` needs the *original* text too, and a `Patch` does not
-carry it — a patch describes a change, not the thing it changes — so `original`
-is threaded from the flow's own input. Both shapes are shown in
-[`flows/`](flows/): `diff-roundtrip.flow.yaml` (Diff → ParseUnifiedDiff) and
-`diff-apply.flow.yaml` (Diff → ApplyPatch, the round trip end to end).
+There is a second, more fundamental limit, and it is honest to state it
+plainly: **`ApplyPatch` cannot terminate a pure diff-tools flow.** It needs the
+*original* text, and a `Patch` does not carry it — a patch describes a change,
+not the thing it changes. A downstream edge sees only its upstream node's
+output, and no node here emits the original text, so `original` has to be
+supplied by the caller. `Diff → ApplyPatch` is therefore an **invoke-level**
+composition (verified exactly, over the whole corpus, by the round-trip and
+`COMPOSE` tests), not a two-node flow. Inside a flow, `ApplyPatch` belongs in a
+compose join whose other source carries the text being patched.
+
+The flow that *is* expressible end to end is
+[`flows/diff-roundtrip.flow.yaml`](flows/diff-roundtrip.flow.yaml) —
+`Diff → ParseUnifiedDiff`, a scalar hop proving the emitted diff is genuinely
+re-parseable.
 
 ## Nodes
 
