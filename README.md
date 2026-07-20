@@ -29,14 +29,18 @@ compiling green. `ApplyPatch` therefore also accepts the diff as **text**, via i
 Diff.unified_diff -> ApplyPatch.unified_diff   # scalar hop, parsed strictly
 ```
 
-There is a second, more fundamental limit, and it is honest to state it
-plainly: **`ApplyPatch` cannot terminate a pure diff-tools flow.** It needs the
-*original* text, and a `Patch` does not carry it — a patch describes a change,
-not the thing it changes. A downstream edge sees only its upstream node's
+There is a second constraint, and it is **ours, not the platform's**:
+a two-node `Diff → ApplyPatch` flow compiles and runs, but **refuses** — `ApplyPatch` needs the *original* text, and a `Patch` does not carry it,
+because a patch describes a change rather than the thing it changes. That is a
+deliberate envelope-design choice: echoing a full copy of the input into every
+diff would double the payload of every `Diff` to serve one flow topology. It
+was considered and rejected, not overlooked. A downstream edge sees only its upstream node's
 output, and no node here emits the original text, so `original` has to be
 supplied by the caller. `Diff → ApplyPatch` is therefore an **invoke-level**
 composition (verified exactly, over the whole corpus, by the round-trip and
-`COMPOSE` tests), not a two-node flow. Inside a flow, `ApplyPatch` belongs in a
+`COMPOSE` tests). Wired as a bare two-node flow it returns a clean, correct
+refusal — "a hunk's context does not match" — because `original` is never
+supplied, rather than failing obscurely. Inside a flow, `ApplyPatch` belongs in a
 compose join whose other source carries the text being patched.
 
 The flow that *is* expressible end to end is
@@ -130,6 +134,10 @@ Failures come back in one of two shapes, and the difference is worth knowing:
 
 So a caller checking only the HTTP status will miss every semantic failure:
 check the `error` field.
+
+**Field casing.** The proto uses `snake_case`, and the JSON API accepts either,
+but responses come back in proto3's `lowerCamelCase` — `unifiedDiff`,
+`oldStart`, `originalName`. Read response fields with the camelCase spelling.
 
 ## Correctness
 

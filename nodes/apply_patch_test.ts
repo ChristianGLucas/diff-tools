@@ -189,6 +189,30 @@ describe('ApplyPatch', () => {
     expect(out.getError()).toContain('empty body');
   });
 
+  // REGRESSION. MAX_HUNKS was a flat 2,000 while Diff at context_lines:-1 can
+  // emit one hunk per changed line — 2,500 from a 5,000-line original — so
+  // ApplyPatch refused patches Diff had just produced, on BOTH paths. Every
+  // budget must admit any patch Diff can emit; none may be set independently
+  // of the input caps.
+  it('BOUNDS: a zero-context patch at the line cap still round-trips', () => {
+    const n = MAX_LINES;
+    const original = Array.from({ length: n }, (_, i) => `L${i}`).join('\n') + '\n';
+    const revised = Array.from({ length: n }, (_, i) => (i % 2 ? `L${i}` : `X${i}`)).join('\n') + '\n';
+
+    const input = new TextPair();
+    input.setOriginal(original);
+    input.setRevised(revised);
+    input.setContextLines(-1);
+    const patch = diff(ctx, input);
+    expect(patch.getError()).toBe('');
+    // Guard the premise: this really is a patch with more hunks than the old cap.
+    expect(patch.getHunksList().length).toBeGreaterThan(2000);
+
+    const out = apply(original, patch);
+    expect(out.getError()).toBe('');
+    expect(out.getText()).toBe(revised);
+  }, 120_000);
+
   it('BOUNDS: rejects a patch with more hunks than the cap', () => {
     const p = new Patch();
     p.setHunksList(Array.from({ length: MAX_HUNKS + 1 }, () => {
@@ -301,6 +325,48 @@ describe('ApplyPatch', () => {
     ]));
     expect(honest.getError()).toBe('');
     expect(honest.getText()).toBe('a\nB');
+  });
+
+  // REGRESSION — marker-free route to an undeclared trailing-newline change.
+  // jsdiff applies against source.split('\n'), whose last element for a
+  // newline-terminated text is a PHANTOM empty string this package's line model
+  // does not have. A marker-free hunk addressing that element deletes or inserts
+  // it, silently stripping or fabricating the file's trailing newline with
+  // balanced counts, legal prefixes and applied:true. Every earlier end-of-file
+  // guard keyed on a "\\" marker, so all of them were bypassed by omitting one.
+  // The invariant is now checked on the APPLIED BYTES, which closes the family
+  // rather than the instance.
+  it('SECURITY: refuses a marker-free patch that changes the trailing newline', () => {
+    const strips = apply('a\n', hunk({ oldStart: 2, oldLines: 1, newStart: 2, newLines: 0 }, ['-']));
+    expect(strips.getApplied()).toBe(false);
+    expect(strips.getError()).toContain('changes the trailing newline without declaring it');
+
+    const fabricates = apply('a', hunk({ oldStart: 2, oldLines: 0, newStart: 2, newLines: 1 }, ['+']));
+    expect(fabricates.getApplied()).toBe(false);
+    expect(fabricates.getError()).toContain('changes the trailing newline without declaring it');
+
+    // Same route via unified-diff text.
+    const req = new PatchApplyRequest();
+    req.setOriginal('a\n');
+    req.setUnifiedDiff('--- original\n+++ revised\n@@ -2 +1,0 @@\n-\n');
+    const viaText = applyPatch(ctx, req);
+    expect(viaText.getApplied()).toBe(false);
+    expect(viaText.getError()).toContain('changes the trailing newline without declaring it');
+  });
+
+  // REGRESSION — jsdiff RELOCATES a hunk whose context does not match at its
+  // declared line, but its end-of-file pass runs BEFORE any hunk is fitted. A
+  // marker-bearing hunk could therefore be relocated into the middle of the file
+  // and still strip the trailing newline off a final line it never mentions.
+  // Validating the declared position cannot secure a relocating applier, so a
+  // marker-bearing hunk must now match exactly where it claims to.
+  it('SECURITY: refuses a marker-bearing hunk that would be relocated', () => {
+    const out = apply('x\nx\nx\ny\n', hunk({ oldStart: 4, oldLines: 1, newStart: 4, newLines: 1 }, [
+      '-x', '+z', '\\ No newline at end of file',
+    ]));
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('must match exactly at its declared line');
+    expect(out.getText()).toBe('');
   });
 
   it('ERROR PATH: refuses a patch whose context does not match, without corrupting the text', () => {

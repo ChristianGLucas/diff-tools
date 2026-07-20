@@ -91,11 +91,19 @@ export function checkPatchBounds(text: string, label: string): void {
 /**
  * Maximum number of hunks in a single patch.
  *
- * Hunk COUNT needs its own bound: the line budget does not constrain it, and
- * each hunk drives a locate-scan in the applier regardless of how small it is.
- * Every real patch is far below this.
+ * DERIVED from MAX_LINES, not chosen: a hunk needs at least one changed line,
+ * so an N-line original cannot produce more than N hunks — that is the true
+ * structural ceiling. A flat 2,000 was smaller than what Diff itself can emit
+ * (5,000 lines with every other line changed at `context_lines: -1` yields
+ * 2,500 hunks), so ApplyPatch refused patches Diff had just produced, breaking
+ * the same round-trip guarantee the line and character budgets exist to keep.
+ * Every budget here must admit any patch Diff can emit; none may be set
+ * independently of the input caps.
+ *
+ * Hunk count still needs its OWN bound — the line budget does not constrain it,
+ * since a hunk drives a locate-scan in the applier regardless of its size.
  */
-export const MAX_HUNKS = 2_000;
+export const MAX_HUNKS = MAX_LINES;
 
 /** The only legal "\" body line in a unified diff. */
 export const NO_NEWLINE_MARKER = '\\ No newline at end of file';
@@ -241,6 +249,8 @@ export function toProtoHunks(hunks: StructuredPatch['hunks']): Hunk[] {
  * silently misapply or refuse without explanation.
  */
 export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch['hunks'] {
+  // Indices of hunks carrying an end-of-file marker; those must be anchored.
+  const markedHunks: number[] = [];
   const originalLines = countLines(original);
   const originalEndsWithNewline = original.length > 0 && original.charCodeAt(original.length - 1) === 10;
   // Bound every dimension the caller controls, on the RAW hunks, before any
@@ -270,7 +280,7 @@ export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch
     );
   }
 
-  return hunks.map((h, i) => {
+  const converted = hunks.map((h, i) => {
     const oldStart = h.getOldStart();
     const newStart = h.getNewStart();
     const oldLines = h.getOldLines();
@@ -480,6 +490,8 @@ export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch
       }
     }
 
+    if (sawMarker) markedHunks.push(i);
+
     // Back to jsdiff's in-memory convention (see toProtoHunks): an empty-side
     // hunk is stored as 0 in unified-diff text but must be 1 in the object the
     // applier consumes, or it silently appends a spurious trailing newline.
@@ -491,6 +503,56 @@ export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch
       lines: [...lines],
     };
   });
+
+  assertMarkedHunksAnchored(converted, markedHunks, original);
+  return converted;
+}
+
+/**
+ * Refuses a marker-bearing hunk that would not apply exactly where it says.
+ *
+ * A marker is a claim about the END OF THE FILE, so its meaning depends on the
+ * hunk's ABSOLUTE position — but jsdiff does not pin position. When the declared
+ * location's context does not match it RELOCATES the hunk and applies it
+ * elsewhere, while its end-of-file pass runs BEFORE any hunk is fitted and
+ * adjusts the trailing newline regardless. So a patch declaring "the line I add
+ * is last and unterminated" could be relocated into the middle of the file and
+ * silently strip the newline from a different final line it never mentions,
+ * returning applied:true.
+ *
+ * Validating the declared position — which the caller controls — cannot secure a
+ * relocating applier, so anchor instead: with a marker present, the hunk's
+ * old-side lines must match the text exactly at the declared start, making
+ * declared and actual position the same and the EOF reasoning sound. Unmarked
+ * hunks keep jsdiff's normal relocation, which is standard patch(1) semantics.
+ */
+function assertMarkedHunksAnchored(
+  hunks: StructuredPatch['hunks'],
+  markedHunks: number[],
+  original: string,
+): void {
+  if (markedHunks.length === 0) return;
+  const textLines = original.split('\n');
+  // A trailing newline closes the last line rather than starting an empty one.
+  if (textLines.length > 0 && textLines[textLines.length - 1] === '') textLines.pop();
+
+  for (const i of markedHunks) {
+    const h = hunks[i];
+    const oldSide: string[] = [];
+    for (const line of h.lines) {
+      const prefix = line.charAt(0);
+      if (prefix === '\\') continue;
+      if (prefix === '-' || prefix === ' ' || line === '') oldSide.push(line.slice(1));
+    }
+    for (let k = 0; k < oldSide.length; k++) {
+      if (textLines[h.oldStart - 1 + k] !== oldSide[k]) {
+        throw new BadInput(
+          `patch does not apply to this text: hunk ${i} declares the end of the file, so it must ` +
+            `match exactly at its declared line ${h.oldStart}, and it does not`,
+        );
+      }
+    }
+  }
 }
 
 /** The filename portion of a "--- "/"+++ " header line: everything before the tab. */

@@ -110,6 +110,11 @@ export function applyPatch(ax: AxiomContext, input: PatchApplyRequest): PatchApp
       return failed('patch has no hunks and is not marked identical');
     }
 
+    // Does the patch say anything at all about the end of the file?
+    const hasMarker = protoHunks.some((h) =>
+      h.getLinesList().some((line) => line.charAt(0) === '\\'),
+    );
+
     const hunks = fromProtoHunks(protoHunks, original);
 
     const out = new PatchApplyResult();
@@ -139,6 +144,32 @@ export function applyPatch(ax: AxiomContext, input: PatchApplyRequest): PatchApp
       out.setApplied(false);
       out.setError("patch does not apply to this text: a hunk's context does not match");
       return out;
+    }
+
+    // CLASS-CLOSING INVARIANT, checked on the applied bytes rather than on the
+    // patch's shape: a patch that says NOTHING about the end of the file must
+    // not change it.
+    //
+    // Every earlier end-of-file guard keyed on the presence of a "\" marker, so
+    // all of them were bypassable by a patch that simply omits one. jsdiff
+    // applies against `source.split('\n')`, whose last element for a
+    // newline-terminated text is a phantom empty string that this package's line
+    // model does not have. A marker-free hunk addressing that phantom element
+    // deletes or inserts it — silently stripping or fabricating the file's
+    // trailing newline, with balanced counts, legal prefixes, and applied:true.
+    // A unified diff whose new side ends unterminated MUST carry the marker, so
+    // a patch without one is asserting the terminator is unchanged. Hold it to
+    // that, and the whole family of marker-free EOF tricks is closed at once —
+    // including any route not yet found, because this checks the OUTPUT.
+    if (!hasMarker) {
+      const endedWithNewline = original.length > 0 && original.charCodeAt(original.length - 1) === 10;
+      const endsWithNewline = result.length > 0 && result.charCodeAt(result.length - 1) === 10;
+      if (original.length > 0 && endedWithNewline !== endsWithNewline) {
+        return failed(
+          'patch changes the trailing newline without declaring it: a diff whose new side ends ' +
+            `without a newline must carry a "${'\\'} No newline at end of file" marker`,
+        );
+      }
     }
 
     ax.log.info('patch applied', { hunks: String(hunks.length) });
