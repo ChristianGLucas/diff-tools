@@ -1,9 +1,15 @@
-// Shared bounds, conversions, and line accounting for the diff-tools nodes.
-// Not a node and not a test file, so it is neither registered nor collected.
+// Shared bounds, conversions, line accounting, and the patch applier for the
+// diff-tools nodes. Not a node and not a test file, so it is neither registered
+// nor collected.
 //
-// The algorithmically hard parts — the diff itself, unified-diff formatting and
-// parsing, and patch application — all belong to jsdiff. This module only
-// enforces input bounds and maps between jsdiff's shapes and the proto messages.
+// The algorithmically hard parts that this package does NOT own — computing the
+// diff, and formatting/parsing unified-diff text — belong to jsdiff. Applying a
+// structured patch, by contrast, is done HERE (splitLines/toApplyHunks/
+// applyStructuredPatch): it is a fully-specified, exact transformation, and
+// delegating it to jsdiff's positioning and end-of-file heuristics was the
+// source of a whole class of trailing-newline and relocation corruption bugs.
+// Owning the applier means this package's model of a patch IS the behaviour,
+// with no second interpreter to disagree with.
 import { Hunk } from '../gen/messages_pb';
 import type { StructuredPatch } from 'diff';
 
@@ -242,23 +248,104 @@ export function toProtoHunks(hunks: StructuredPatch['hunks']): Hunk[] {
 }
 
 /**
- * Converts proto Hunks back into the shape jsdiff's applyPatch consumes,
- * validating each one. A hunk with a non-finite or non-positive start, a
- * negative length, or a body line carrying an unknown prefix is rejected rather
- * than guessed at — jsdiff itself is permissive here and would otherwise
- * silently misapply or refuse without explanation.
+ * A single text line: its content, plus whether it was terminated by a newline.
+ *
+ * Only the LAST line of a well-formed text may be unterminated. This model is
+ * the whole reason ApplyPatch no longer delegates application to jsdiff: the
+ * trailing newline is an explicit property of a specific line, not a global
+ * flag inferred from a "\" marker's position, so there is no second interpreter
+ * to disagree with about what the same bytes mean.
  */
-export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch['hunks'] {
-  // Indices of hunks carrying an end-of-file marker; those must be anchored.
-  const markedHunks: number[] = [];
-  const originalLines = countLines(original);
-  const originalEndsWithNewline = original.length > 0 && original.charCodeAt(original.length - 1) === 10;
+export interface Line {
+  content: string;
+  /** True when this line is followed by a "\n" in the text. */
+  eol: boolean;
+}
+
+/**
+ * Splits a text into lines under this package's model, the exact inverse of
+ * joinLines: an empty text is zero lines; "\n" separates lines; a trailing "\n"
+ * closes the final line rather than beginning an empty one, so only the last
+ * line may be unterminated ("a\nb\n" -> [a•, b•]; "a\nb" -> [a•, b]).
+ *
+ * Crucially there is NO phantom trailing element — the source of an entire class
+ * of the older apply path's newline bugs, where jsdiff applied against
+ * `source.split('\n')` and a hunk could address the "" that split appends to a
+ * newline-terminated text. Here that "" is never a line, so nothing can address
+ * it, and the trailing newline can only change if a hunk's own line says so.
+ */
+export function splitLines(text: string): Line[] {
+  if (text === '') return [];
+  const parts = text.split('\n');
+  const trailingNewline = parts[parts.length - 1] === '';
+  const n = trailingNewline ? parts.length - 1 : parts.length;
+  const lines: Line[] = [];
+  for (let i = 0; i < n; i++) {
+    lines.push({ content: parts[i], eol: trailingNewline || i < n - 1 });
+  }
+  return lines;
+}
+
+/** Reconstructs text from lines; the exact byte-for-byte inverse of splitLines. */
+export function joinLines(lines: Line[]): string {
+  let out = '';
+  for (const l of lines) out += l.eol ? l.content + '\n' : l.content;
+  return out;
+}
+
+/**
+ * A hunk parsed for exact application: the old and new sides as explicit Line
+ * runs (each line's newline resolved from any "\" marker), plus the declared
+ * old-side start in unified-diff numbering.
+ */
+export interface ApplyHunk {
+  /** Position of this hunk in the patch, for error messages. */
+  index: number;
+  /** As-written old-side start (1-based; 0 for a zero-line side, e.g. "@@ -0,0"). */
+  oldStart: number;
+  /** The lines the hunk consumes from the original (context + removed), in order. */
+  old: Line[];
+  /** The lines the hunk produces in the revised text (context + added), in order. */
+  new: Line[];
+}
+
+/** No line but the last of a side may be unterminated; a marker elsewhere is malformed. */
+function assertOnlyLastUnterminated(side: Line[], hunk: number, which: string): void {
+  for (let k = 0; k < side.length - 1; k++) {
+    if (!side[k].eol) {
+      throw new BadInput(
+        `hunk ${hunk} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker on a non-final line of the ` +
+          `${which} side; only the last line of a side may lack a trailing newline`,
+      );
+    }
+  }
+}
+
+/**
+ * Parses proto Hunks into the explicit-Line form applyStructuredPatch consumes,
+ * validating each one structurally. This validates that the patch is
+ * WELL-FORMED — legal prefixes, a legal marker in a legal place, header counts
+ * that match the body, sane bounds. It deliberately does NOT try to predict what
+ * an applier will DO with the patch (which line moves, whether a marker changes
+ * the trailing newline): that is the applier's job, done by exact matching
+ * against the actual text, so there is no divergence between a validator's model
+ * and an applier's behaviour to exploit.
+ *
+ * A "\" marker sets eol=false on the last line of whichever side(s) the
+ * preceding body line belonged to — a context line belongs to both sides, so a
+ * marker after one marks both, exactly as a shared unterminated final line
+ * means. A hunk with a non-integer or negative start/count, an unknown body
+ * prefix, an illegal or misplaced marker, or a header whose counts disagree with
+ * its body is rejected here rather than misapplied later.
+ */
+export function toApplyHunks(hunks: Hunk[]): ApplyHunk[] {
   // Bound every dimension the caller controls, on the RAW hunks, before any
-  // conversion. Line count alone is not enough: a zero-line hunk contributes
-  // nothing to that budget yet still drives a scan in the applier, and a body
-  // line's LENGTH is unbounded, so 10,002 lines could carry gigabytes. Only the
-  // gateway's ~1MB body limit stood behind these, and that is an external
-  // control this node does not own.
+  // allocation. Line count alone is not enough: a body line's LENGTH is
+  // unbounded, so few lines could still carry gigabytes. Only the gateway's
+  // ~1MB body limit stood behind these, an external control this node does not
+  // own. (The old start-magnitude DoS is gone independently of these bounds:
+  // applyStructuredPatch indexes the text directly and refuses an out-of-range
+  // start in O(1), never scanning outward from it as jsdiff's applier did.)
   if (hunks.length > MAX_HUNKS) {
     throw new BadInput(`patch has more than ${MAX_HUNKS} hunks (got ${hunks.length})`);
   }
@@ -280,7 +367,7 @@ export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch
     );
   }
 
-  const converted = hunks.map((h, i) => {
+  return hunks.map((h, i) => {
     const oldStart = h.getOldStart();
     const newStart = h.getNewStart();
     const oldLines = h.getOldLines();
@@ -291,35 +378,23 @@ export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch
     }
     // Unified-diff line numbers are 1-based, EXCEPT that a hunk against an empty
     // side legitimately starts at 0 (`@@ -0,0 +1,3 @@`), which is what GNU diff
-    // emits when a file is created or emptied. Rejecting 0 would refuse a valid
-    // patch, so only negative starts are invalid.
+    // emits when a file is created or emptied. Only negative starts are invalid.
     if (oldStart < 0 || newStart < 0) {
       throw new BadInput(`hunk ${i} has a negative start line`);
     }
     if (oldLines < 0 || newLines < 0) {
       throw new BadInput(`hunk ${i} has a negative line count`);
     }
-    // A start line beyond the end of the text is not merely wrong, it is a
-    // denial of service: jsdiff locates a hunk by scanning linearly outward from
-    // the declared start, so the cost is linear in the START MAGNITUDE and is
-    // bounded by nothing else here. The line and body caps do not constrain it —
-    // a ~150-byte patch declaring oldStart 2147483647 pins a core for ~30s.
-    // The applier is given the original, so the only sane bound is knowable:
-    // a hunk cannot legitimately begin past one line after the text ends.
-    // ONLY old_start may be bounded by the original: it is the only start the
-    // applier scans the given text for, so it is the only one carrying the DoS
-    // risk — and it is the only one this node can bound correctly.
-    //
-    // new_start indexes the REVISED text, which ApplyPatch does not have and
-    // which is LONGER than the original whenever the patch nets an insertion.
-    // Bounding it by originalLines rejected ordinary multi-hunk patches — insert
-    // a block early, edit further down, and the later hunk's new_start
-    // legitimately exceeds the original's length — so ApplyPatch refused patches
-    // Diff had just emitted. It gets the same sanity cap ParseUnifiedDiff uses.
-    if (oldStart > originalLines + 1) {
+    // A sane upper bound on the declared numbering, kept identical to the bound
+    // ParseUnifiedDiff enforces so the two readers of one patch agree. This is
+    // no longer load-bearing for cost (the applier bounds the real work against
+    // the actual text), but a clean early rejection beats a confusing one, and
+    // new_start is otherwise unused: the applier emits the new side in order and
+    // never trusts a caller-declared revised position, so a lying new_start
+    // cannot misplace a line — it just gets a sanity check.
+    if (oldStart > MAX_LINES + 1) {
       throw new BadInput(
-        `hunk ${i} starts past the end of the text ` +
-          `(old_start=${oldStart}, text has ${originalLines} lines)`,
+        `hunk ${i} has old_start=${oldStart}, beyond the maximum of ${MAX_LINES} lines`,
       );
     }
     if (newStart > MAX_LINES + 1) {
@@ -328,231 +403,174 @@ export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch
       );
     }
 
-    const lines = h.getLinesList();
-    let oldBody = 0; // lines the hunk consumes from the original: context + removed
-    let newBody = 0; // lines the hunk produces in the revised text: context + added
-    let markers = 0; // "\ No newline at end of file" markers seen in this hunk
-    let sawMarker = false;
-    for (let j = 0; j < lines.length; j++) {
-      const line = lines[j];
+    const body = h.getLinesList();
+    if (body.length === 0) {
+      throw new BadInput(`hunk ${i} has an empty body`);
+    }
+
+    const oldSide: Line[] = [];
+    const newSide: Line[] = [];
+    // The side(s) the previous non-marker body line appended to, so a following
+    // marker knows which line(s) it unterminates. Empty means the previous line
+    // was itself a marker (or we are at the start) — no marker may follow.
+    let prevSides: Line[][] = [];
+    for (let j = 0; j < body.length; j++) {
+      const line = body[j];
       const prefix = line.charAt(0);
-      if (line !== '' && prefix !== ' ' && prefix !== '-' && prefix !== '+' && prefix !== '\\') {
-        throw new BadInput(
-          `hunk ${i} has a body line with an unknown prefix ${JSON.stringify(prefix)} ` +
-            `(expected " ", "-", "+", or "\\")`,
-        );
-      }
       if (prefix === '\\') {
-        // The only legal backslash line is the end-of-file marker. jsdiff keys
-        // its trailing-newline handling off the "\" prefix alone, so an
-        // unchecked marker is both free payload and a way to steer that
-        // behaviour from an arbitrary position in the body.
+        // The only legal "\" line is the end-of-file marker.
         if (line !== NO_NEWLINE_MARKER) {
           throw new BadInput(
             `hunk ${i} has a "\\" body line that is not ${JSON.stringify(NO_NEWLINE_MARKER)}`,
           );
         }
-        // The marker terminates a RUN, not the hunk: it follows the last line of
-        // whichever side lacks the trailing newline. When only the original side
-        // lacks one, Diff emits it mid-hunk, between the "-" run and the "+" run
-        // — so requiring it to be the hunk's final line would reject patches
-        // this package itself produces. It must still follow a real body line,
-        // and a hunk has at most two sides to terminate.
-        if (j === 0) {
+        if (prevSides.length === 0) {
           throw new BadInput(
-            `hunk ${i} begins with a ${JSON.stringify(NO_NEWLINE_MARKER)} marker`,
+            `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker that does not follow a body line`,
           );
         }
-        // Enforce the invariant, rather than merely stating it. jsdiff's applier
-        // scans the last hunk for ANY line starting with "\\" and, seeing the
-        // PRECEDING line's side, strips that side's trailing newline. So a marker
-        // parked mid-hunk after a "+" line silently removes the result's trailing
-        // newline while the "@@" counts still balance — the validator and the
-        // applier disagreeing about the same bytes again, and the round trip no
-        // longer reproducing the revised text exactly. A marker is legal ONLY
-        // where a side genuinely ends:
-        //   - after a "-" line, when the new side follows (old side ends), or
-        //   - as the hunk's final line (whichever side it terminates).
-        const prev = lines[j - 1].charAt(0);
-        const isLast = j === lines.length - 1;
-        if (prev === '\\') {
-          throw new BadInput(`hunk ${i} has consecutive ${JSON.stringify(NO_NEWLINE_MARKER)} markers`);
-        }
-        // Structural position. A marker terminates a RUN, so it is legal as the
-        // hunk's final line (ending whichever side stops there — including a
-        // shared context line, which is exactly what jsdiff's own formatter
-        // emits when both texts end unterminated), or between the "-" run and
-        // the "+" run, ending the OLD side only.
-        if (!isLast && !(prev === '-' && lines[j + 1].charAt(0) === '+')) {
-          throw new BadInput(
-            `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker that does not terminate a side`,
-          );
-        }
-        // A mid-hunk marker declares that the OLD side ends right here, so no
-        // later line may belong to the old side. Checking only that a "+"
-        // follows is not enough: a context line further down is on BOTH sides,
-        // so the old side would in fact continue past the marker. jsdiff honours
-        // the marker regardless and pushes a trailing newline, producing the
-        // opposite of what a later marker in the same hunk declares.
-        if (!isLast) {
-          for (let k = j + 1; k < lines.length; k++) {
-            const p2 = lines[k].charAt(0);
-            const onOldSide = p2 === '-' || p2 === ' ' || lines[k] === '';
-            if (onOldSide) {
-              throw new BadInput(
-                `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker for the original, ` +
-                  `but the original side continues after it`,
-              );
-            }
-          }
-        }
-        // CONSISTENCY with the text being patched. A marker is a DECLARATION —
-        // "the side ending here has no trailing newline" — and jsdiff's EOFNL
-        // prescan only ever acts on a marker preceded by "+" or "-". A marker
-        // that makes a claim about the OLD side (preceded by "-", or by a
-        // context line, which belongs to both sides) is therefore checkable
-        // against the original we were handed, and must be refused when it
-        // contradicts it. Without this a patch could declare "the result does
-        // not end in a newline" against an original that does, the applier would
-        // ignore the declaration, and the output would silently carry a newline
-        // the patch forbade — the applied bytes disagreeing with the patch.
-        if (prev !== '+' && originalEndsWithNewline) {
-          throw new BadInput(
-            `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker for the original, ` +
-              `but the original does end with a newline`,
-          );
-        }
-        sawMarker = true;
-        markers++;
-        if (markers > 2) {
-          throw new BadInput(
-            `hunk ${i} has more than two ${JSON.stringify(NO_NEWLINE_MARKER)} markers`,
-          );
-        }
-        continue; // the marker itself consumes and produces nothing
+        // The marker declares the preceding line unterminated. A context line is
+        // on both sides, so a marker after it unterminates both — exactly the
+        // meaning of a shared final line that ends without a newline.
+        for (const side of prevSides) side[side.length - 1].eol = false;
+        prevSides = []; // a marker cannot be followed immediately by another marker
+        continue;
       }
+      if (line !== '' && prefix !== ' ' && prefix !== '-' && prefix !== '+') {
+        throw new BadInput(
+          `hunk ${i} has a body line with an unknown prefix ${JSON.stringify(prefix)} ` +
+            `(expected " ", "-", "+", or "\\")`,
+        );
+      }
+      // A " "-prefixed line is context; so is a bare "" line — real unified diffs
+      // routinely lose the single space on a blank context line (git send-email,
+      // mailing lists, editors that strip trailing whitespace). Content is the
+      // line minus its one-character prefix ("" stays "").
+      const content = line === '' ? '' : line.slice(1);
       if (prefix === '-') {
-        oldBody++;
+        oldSide.push({ content, eol: true });
+        prevSides = [oldSide];
       } else if (prefix === '+') {
-        newBody++;
+        newSide.push({ content, eol: true });
+        prevSides = [newSide];
       } else {
-        // A " "-prefixed line is context. So is a bare "" line: real-world
-        // unified diffs routinely lose the single space on a blank context line
-        // (git send-email, mailing lists, editors that strip trailing
-        // whitespace), and jsdiff's applier resolves an empty body line to a
-        // context line — `hunkLine[0]` is undefined, so its operation defaults
-        // to " ". Counting "" as neither side made this validator disagree with
-        // the applier over the same bytes, which both accepted hunks whose
-        // header understated their true reach and rejected honest headers.
-        oldBody++;
-        newBody++;
+        oldSide.push({ content, eol: true });
+        newSide.push({ content, eol: true });
+        prevSides = [oldSide, newSide];
       }
     }
 
-    if (lines.length === 0) {
-      throw new BadInput(`hunk ${i} has an empty body`);
-    }
-
-    // The @@ header's declared line counts must match the body the hunk actually
-    // carries. jsdiff positions by the declared counts but edits by the body, so
-    // a hunk whose header lies about its size would still "apply" — accepting
-    // that would make a Patch's header and body silently disagree. Reject it.
-    if (oldLines !== oldBody || newLines !== newBody) {
+    // The "@@" header's declared counts must match the body the hunk carries.
+    // A header that lied about its size but still applied would let a Patch's
+    // header and body silently disagree.
+    if (oldLines !== oldSide.length || newLines !== newSide.length) {
       throw new BadInput(
         `hunk ${i} header (old_lines=${oldLines}, new_lines=${newLines}) does not match its body ` +
-          `(counted old=${oldBody}, new=${newBody})`,
+          `(counted old=${oldSide.length}, new=${newSide.length})`,
       );
     }
 
-    // A marker is only MEANINGFUL for a hunk that actually reaches the end of the
-    // file, and jsdiff enforces nothing of the kind: its EOFNL pass scans only
-    // the LAST hunk for a "\\" line, reads the preceding line's prefix, and then
-    // pops or pushes a trailing empty line on the WHOLE result before any hunk is
-    // fitted. So a structurally-legal marker on a hunk that touches line 1 of a
-    // long file silently adds or removes the trailing newline of the entire
-    // output, with the "@@" counts still balancing and applied coming back true.
-    // Validating the marker's neighbours is therefore not enough — the side it
-    // claims to terminate must genuinely end at EOF, and only the final hunk can.
-    if (sawMarker) {
-      if (i !== hunks.length - 1) {
-        throw new BadInput(
-          `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker but is not the last hunk`,
-        );
-      }
-      // Where the old side stops. A hunk that consumes nothing (a pure addition,
-      // e.g. against an empty original) stops at its own start.
-      const endOfOldSide = oldBody > 0 ? oldStart + oldBody - 1 : oldStart;
-      if (endOfOldSide !== originalLines) {
-        throw new BadInput(
-          `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker but does not reach the end ` +
-            `of the text (hunk ends at line ${endOfOldSide}, text has ${originalLines} lines)`,
-        );
-      }
-    }
+    // A marker may only unterminate the LAST line of a side. A marker that
+    // leaves a non-final line unterminated describes a text that cannot exist
+    // (only the last line of a text lacks a newline), so it is malformed. This
+    // one structural rule replaces all the older path's marker-position
+    // gymnastics, because the applier enforces the SEMANTICS by exact match.
+    assertOnlyLastUnterminated(oldSide, i, 'original');
+    assertOnlyLastUnterminated(newSide, i, 'revised');
 
-    if (sawMarker) markedHunks.push(i);
-
-    // Back to jsdiff's in-memory convention (see toProtoHunks): an empty-side
-    // hunk is stored as 0 in unified-diff text but must be 1 in the object the
-    // applier consumes, or it silently appends a spurious trailing newline.
-    return {
-      oldStart: oldLines === 0 ? oldStart + 1 : oldStart,
-      oldLines,
-      newStart: newLines === 0 ? newStart + 1 : newStart,
-      newLines,
-      lines: [...lines],
-    };
+    return { index: i, oldStart, old: oldSide, new: newSide };
   });
-
-  assertMarkedHunksAnchored(converted, markedHunks, original);
-  return converted;
 }
 
 /**
- * Refuses a marker-bearing hunk that would not apply exactly where it says.
+ * Applies structured hunks to a text EXACTLY, and is the whole point of the
+ * redesign: it never delegates application to jsdiff, so no second interpreter
+ * can disagree with this package's model of the patch. Every one of the apply
+ * path's historical corruption bugs was that disagreement — jsdiff relocating a
+ * hunk, resolving a bare "" line, or stripping a trailing newline in a prescan,
+ * differently from what the package's validator predicted. Here the package IS
+ * the applier, so its model is the behaviour by construction.
  *
- * A marker is a claim about the END OF THE FILE, so its meaning depends on the
- * hunk's ABSOLUTE position — but jsdiff does not pin position. When the declared
- * location's context does not match it RELOCATES the hunk and applies it
- * elsewhere, while its end-of-file pass runs BEFORE any hunk is fitted and
- * adjusts the trailing newline regardless. So a patch declaring "the line I add
- * is last and unterminated" could be relocated into the middle of the file and
- * silently strip the newline from a different final line it never mentions,
- * returning applied:true.
+ * Semantics, all standard and all enforced against the ACTUAL text:
+ *  - Position is pinned to the declared line. Each hunk's old side must match the
+ *    text exactly — content AND trailing-newline — starting at its declared
+ *    line. No fuzz, no relocation: a mismatch is refused, never applied
+ *    elsewhere. (This is stricter than patch(1), and deliberately so — it is the
+ *    exact round-trip contract Diff's output relies on.)
+ *  - Hunks apply left to right; one that overlaps or precedes an already-applied
+ *    hunk, or that starts past the end of the text, is refused.
+ *  - The trailing newline of the result is whatever the hunks' own lines say via
+ *    their "\" markers, applied to specific lines — it is never inferred from a
+ *    marker's position or a phantom split element.
  *
- * Validating the declared position — which the caller controls — cannot secure a
- * relocating applier, so anchor instead: with a marker present, the hunk's
- * old-side lines must match the text exactly at the declared start, making
- * declared and actual position the same and the EOF reasoning sound. Unmarked
- * hunks keep jsdiff's normal relocation, which is standard patch(1) semantics.
+ * Throws BadInput on any non-application; the caller reports that as
+ * applied:false with the reason, never a partial or half-patched text.
  */
-function assertMarkedHunksAnchored(
-  hunks: StructuredPatch['hunks'],
-  markedHunks: number[],
-  original: string,
-): void {
-  if (markedHunks.length === 0) return;
-  const textLines = original.split('\n');
-  // A trailing newline closes the last line rather than starting an empty one.
-  if (textLines.length > 0 && textLines[textLines.length - 1] === '') textLines.pop();
+export function applyStructuredPatch(original: string, hunks: ApplyHunk[]): string {
+  const src = splitLines(original);
+  const result: Line[] = [];
+  let pos = 0; // next unconsumed index into src
 
-  for (const i of markedHunks) {
-    const h = hunks[i];
-    const oldSide: string[] = [];
-    for (const line of h.lines) {
-      const prefix = line.charAt(0);
-      if (prefix === '\\') continue;
-      if (prefix === '-' || prefix === ' ' || line === '') oldSide.push(line.slice(1));
+  for (const h of hunks) {
+    // Where the old side begins, 0-indexed. A zero-line old side ("@@ -L,0")
+    // inserts AFTER original line L — 0-indexed position L (0 for start-of-file,
+    // src.length for append). A non-empty old side's first line is 1-based line
+    // oldStart — 0-indexed oldStart-1.
+    const at = h.old.length === 0 ? h.oldStart : h.oldStart - 1;
+
+    if (at < pos) {
+      throw new BadInput(
+        `patch does not apply to this text: hunk ${h.index} overlaps or precedes an earlier hunk`,
+      );
     }
-    for (let k = 0; k < oldSide.length; k++) {
-      if (textLines[h.oldStart - 1 + k] !== oldSide[k]) {
+    if (at > src.length) {
+      throw new BadInput(
+        `patch does not apply to this text: hunk ${h.index} starts at line ${h.oldStart}, ` +
+          `past the end of a ${src.length}-line text`,
+      );
+    }
+    if (at + h.old.length > src.length) {
+      throw new BadInput(
+        `patch does not apply to this text: hunk ${h.index}'s context runs past the end of the text`,
+      );
+    }
+    // Exact match of the old side against the text — content AND terminator.
+    for (let k = 0; k < h.old.length; k++) {
+      const s = src[at + k];
+      const o = h.old[k];
+      if (s.content !== o.content || s.eol !== o.eol) {
         throw new BadInput(
-          `patch does not apply to this text: hunk ${i} declares the end of the file, so it must ` +
-            `match exactly at its declared line ${h.oldStart}, and it does not`,
+          `patch does not apply to this text: hunk ${h.index}'s context does not match at line ${at + k + 1}`,
         );
       }
     }
+    // Copy the unchanged run before the hunk, then the hunk's new side.
+    for (let k = pos; k < at; k++) result.push(src[k]);
+    for (const l of h.new) result.push(l);
+    pos = at + h.old.length;
   }
+  for (let k = pos; k < src.length; k++) result.push(src[k]);
+
+  // CLASS-CLOSING INVARIANT, checked on the APPLIED BYTES. A "\" marker sets its
+  // line unterminated, but a line without a trailing newline can only be the
+  // LAST line of a text. If a hunk marks its new side's final line unterminated
+  // while more lines follow it in the result — a marker on any but the last
+  // hunk, or on a hunk that does not actually reach the end of the file — then
+  // joinLines would concatenate that line with the next, silently corrupting the
+  // output. Refuse instead. This checks the OUTPUT, so it holds no matter how a
+  // marker's position or the text conspire to reach it: the whole family of
+  // end-of-file tricks the old delegated path lost seven rounds to is closed at
+  // once, because a patch may only leave the file's true last line unterminated.
+  for (let k = 0; k < result.length - 1; k++) {
+    if (!result[k].eol) {
+      throw new BadInput(
+        `patch does not apply to this text: it marks line ${k + 1} of the result as having no ` +
+          `trailing newline, but that line is not the end of the file`,
+      );
+    }
+  }
+
+  return joinLines(result);
 }
 
 /** The filename portion of a "--- "/"+++ " header line: everything before the tab. */

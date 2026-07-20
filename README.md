@@ -75,12 +75,17 @@ re-parseable.
 - **Self-consistent envelope.** A `Patch`'s hunk numbers always match the `@@`
   headers in its own `unified_diff`, a hunk's header counts must match its body,
   and a parsed patch is indistinguishable from a generated one.
-- **Exact content matching, explicitly.** Line-ending conversion is pinned OFF:
-  an LF patch against a CRLF original is refused, not silently rewritten to fit.
-  (jsdiff enables that conversion by default when the option is omitted, which
-  would delete bytes the patch author never wrote.) Position is not pinned — as
-  with `git apply` and patch(1), a hunk whose context matches may apply at an
-  offset from its declared line number.
+- **Exact content matching, explicitly.** `ApplyPatch` applies the structured
+  hunks itself rather than delegating to the diff library, matching each hunk's
+  old side against the original **exactly** — content *and* trailing newline —
+  with no line-ending conversion: an LF patch against a CRLF original is refused,
+  not silently rewritten to fit.
+- **Position is pinned to the declared line.** Unlike `git apply` and patch(1),
+  `ApplyPatch` does **not** relocate a hunk whose context fails to match at its
+  stated line — it refuses. This is stricter than standard patch semantics, and
+  deliberately so: the exact round-trip contract depends on a hunk landing where
+  it says, and pinning position removes the relocation behaviour that let a
+  crafted patch corrupt a line it never named.
 - **Strict, not permissive.** Prose that merely *talks about* a change is
   rejected rather than silently reported as "no changes"; a malformed `@@` header
   is an error, not a null-numbered hunk; a patch whose context does not match is
@@ -101,11 +106,11 @@ re-parseable.
   can emit is one `ApplyPatch` will accept — as the envelope *or* as text. The diff is O(N·D), so two
   wholly-dissimilar texts are the worst case: measured at roughly 2.0s at 2,000
   lines and **~7-8s at the 5,000-line cap**, versus the ~44s that 20,000 lines
-  would take. The hunk start the applier actually scans for (`old_start`) is
-  bounded by the text being patched, because locating a hunk means scanning
-  outward from the declared start — an unbounded start is a denial of service no
-  size cap constrains. `new_start` indexes a revised text `ApplyPatch` never
-  sees, so it gets the same 5,000-line sanity cap instead.
+  would take. Applying a patch is linear in the size of the text and the patch —
+  `ApplyPatch` indexes the text directly instead of scanning outward from a
+  declared start, so a hunk start past the end of the file is refused in constant
+  time rather than becoming a denial of service. Both `old_start` and `new_start`
+  still get a 5,000-line sanity cap so an absurd number is rejected early.
 - **Deterministic and offline.** No network, no state, no secrets, no clock.
 
 ### Line model
@@ -145,15 +150,20 @@ Beyond golden tests, the suite includes an **independent oracle**: a from-scratc
 longest-common-subsequence dynamic program that shares no code with the underlying
 library. `Similarity`'s matching-line count and `Stats`' added/deleted counts are
 checked against it across the whole corpus, so agreement is evidence of
-correctness rather than of self-consistency. A separate differential test shells
-out to the system `git apply` to confirm the emitted diffs are genuinely
-apply-compatible, not merely self-consistent.
+correctness rather than of self-consistency. The apply path is proven by a
+**seeded fuzz** of thousands of generated `Diff → ApplyPatch` round trips across
+every context setting and both supply modes, asserting byte-exact reproduction,
+plus a differential test that shells out to the system `git apply` to confirm the
+emitted diffs are genuinely apply-compatible, not merely self-consistent.
 
 ## Built on
 
 [jsdiff](https://github.com/kpdecker/jsdiff) (`diff` 8.0.2, BSD-3-Clause), which
-owns the diff algorithm, unified-diff formatting and parsing, and patch
-application. It has zero transitive runtime dependencies. See
+owns the diff algorithm and unified-diff formatting and parsing. Patch
+*application* is done by this package directly — matching each hunk against the
+text exactly — so the round-trip contract is enforced by this package's own code
+rather than inherited from the library's positioning and end-of-file heuristics.
+jsdiff has zero transitive runtime dependencies. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License

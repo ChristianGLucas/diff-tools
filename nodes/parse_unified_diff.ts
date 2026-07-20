@@ -103,22 +103,19 @@ export function parseUnifiedDiff(ax: AxiomContext, input: UnifiedDiffText): Patc
           );
         }
         // Refuse an absurd line number here rather than laundering it into a
-        // Patch envelope. ApplyPatch bounds starts against the text it is given,
-        // but a Patch minted from hostile diff TEXT would otherwise travel
-        // through a flow as a loaded gun: jsdiff's applier scans linearly from
-        // the declared start, so a header of "@@ -2000000000,1 +2000000000,1 @@"
-        // costs ~30s of CPU at the far end. No line number in a diff this
-        // package will accept can legitimately exceed the input line cap.
-        // Bound the TEXT numbering, which is what the caller wrote and what the
-        // envelope commits to — not jsdiff's in-memory normalization, which
-        // reports start+1 for a zero-line side. Checking the normalized value
-        // refused a legal "@@ -5000,0 +5001,1 @@" append at the cap that the
-        // sibling path accepted, and reported "old_start=5001" for a header
-        // plainly reading -5000, which a caller cannot reconcile with their
-        // diff. MAX_LINES + 1 matches fromProtoHunks: lines+1 is the legitimate
-        // append position. The two readers of one patch must agree, off-by-one
-        // included — a disagreement is how a patch becomes acceptable to one
-        // node and refused by its sibling.
+        // Patch envelope. A line number no diff this package accepts can
+        // legitimately exceed the input line cap, so a header of
+        // "@@ -2000000000,1 +2000000000,1 @@" is refused up front on both the
+        // parse and apply paths. Bound the TEXT numbering, which is what the
+        // caller wrote and what the envelope commits to — not the in-memory
+        // normalization that reports start+1 for a zero-line side. Checking the
+        // normalized value refused a legal "@@ -5000,0 +5001,1 @@" append at the
+        // cap that the sibling path accepted, and reported "old_start=5001" for a
+        // header plainly reading -5000, which a caller cannot reconcile with
+        // their diff. MAX_LINES + 1 matches the bound toApplyHunks enforces:
+        // lines+1 is the legitimate append position. The two readers of one patch
+        // must agree, off-by-one included — a disagreement is how a patch becomes
+        // acceptable to one node and refused by its sibling.
         const asWritten = zeroLineSide ? value - 1 : value;
         if (asWritten > MAX_LINES + 1) {
           throw new BadInput(
