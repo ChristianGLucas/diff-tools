@@ -1,7 +1,7 @@
 import { UnifiedDiffText, Patch } from '../gen/messages_pb';
 import { AxiomContext } from '../gen/axiomContext';
 import { parsePatch } from 'diff';
-import { BadInput, MAX_LINES, checkBounds, errorMessage, headerNames, toProtoHunks } from './lib';
+import { BadInput, MAX_LINES, checkPatchBounds, errorMessage, headerNames, nameOr, toProtoHunks } from './lib';
 
 /**
  * Parse standard unified-diff text (---/+++/@@ hunks) into the canonical Patch
@@ -20,8 +20,11 @@ import { BadInput, MAX_LINES, checkBounds, errorMessage, headerNames, toProtoHun
  * strictness is deliberate — silently reporting "no changes" for a diff the
  * caller believed was real is the dangerous failure here. Multi-file diffs are
  * also rejected, since this envelope describes exactly one file; split them and
- * parse each separately. Input above 1,000,000 characters or 5,000 lines is
- * rejected with a structured error.
+ * parse each separately. A diff document is budgeted as a PATCH rather than as a
+ * text — it carries both sides, so it is inherently about twice the size of
+ * either text it describes — and one above 2,004,096 characters or 15,010 lines
+ * is rejected with a structured error, as is a hunk whose "@@" header declares a
+ * line number beyond the 5,000-line input cap.
  *
  * Deterministic and fully offline.
  *
@@ -30,7 +33,7 @@ import { BadInput, MAX_LINES, checkBounds, errorMessage, headerNames, toProtoHun
 export function parseUnifiedDiff(ax: AxiomContext, input: UnifiedDiffText): Patch {
   try {
     const text = input.getUnifiedDiff() || '';
-    checkBounds(text, 'unified_diff');
+    checkPatchBounds(text, 'unified_diff');
 
     const out = new Patch();
 
@@ -110,11 +113,15 @@ export function parseUnifiedDiff(ax: AxiomContext, input: UnifiedDiffText): Patc
       );
     }
 
+    // Route parsed names through the SAME validator Diff uses. Otherwise the two
+    // producers of this envelope disagree about what a legal name is, and a
+    // Patch minted from hostile diff text could carry a name Diff itself would
+    // have refused — laundered through a flow to whatever consumes it next.
     const names = headerNames(text);
     out.setUnifiedDiff(text);
     out.setHunksList(toProtoHunks(hunks));
-    out.setOriginalName(names.original);
-    out.setRevisedName(names.revised);
+    out.setOriginalName(nameOr(names.original, 'original'));
+    out.setRevisedName(nameOr(names.revised, 'revised'));
     out.setIdentical(hunks.length === 0);
 
     ax.log.info('unified diff parsed', { hunks: String(hunks.length) });

@@ -1,7 +1,7 @@
 import { PatchApplyRequest, PatchApplyResult, UnifiedDiffText } from '../gen/messages_pb';
 import { AxiomContext } from '../gen/axiomContext';
 import { applyPatch as jsApplyPatch } from 'diff';
-import { checkBounds, countLines, errorMessage, fromProtoHunks, nameOr } from './lib';
+import { checkBounds, checkPatchBounds, countLines, errorMessage, fromProtoHunks, nameOr } from './lib';
 import { parseUnifiedDiff } from './parse_unified_diff';
 
 /** A refusal: never a partially-patched text, so text stays empty. */
@@ -37,7 +37,9 @@ function unifiedDiffInput(text: string): UnifiedDiffText {
  * failed upstream step must not read as a successful identity. Likewise a patch
  * with no hunks is applied as an identity only when it is marked identical.
  *
- * Content matching is exact: when a hunk's context does not match the text,
+ * Content matching is exact, including line endings: conversion is pinned off,
+ * so an LF patch against a CRLF original is refused rather than rewritten to
+ * fit. When a hunk's context does not match the text,
  * applied is false and error says so. The node never fuzzy-matches content,
  * never applies a patch partially, and never returns a half-patched text — on
  * any failure, text is empty. POSITION, however, is not pinned: as with `git
@@ -48,7 +50,9 @@ function unifiedDiffInput(text: string): UnifiedDiffText {
  * end of the text, a body line carrying an unknown prefix, or a "\" line that is
  * not exactly the end-of-file marker terminating a side is rejected outright, as
  * is an original above 1,000,000 characters or 5,000 lines, or a patch whose
- * hunks span more than 10,002 body lines.
+ * hunks span more than 10,002 body lines. A patch supplied as TEXT is budgeted
+ * as a patch, not as a text — it carries both sides, so it is inherently about
+ * twice the size of what it describes.
  *
  * Deterministic and fully offline.
  *
@@ -86,7 +90,7 @@ export function applyPatch(ax: AxiomContext, input: PatchApplyRequest): PatchApp
     let protoHunks;
     let identical: boolean;
     if (hasUnifiedDiff) {
-      checkBounds(unifiedDiff, 'unified_diff');
+      checkPatchBounds(unifiedDiff, 'unified_diff');
       const parsed = parseUnifiedDiff(ax, unifiedDiffInput(unifiedDiff));
       if (parsed.getError()) {
         return failed(parsed.getError());
@@ -121,6 +125,14 @@ export function applyPatch(ax: AxiomContext, input: PatchApplyRequest): PatchApp
       oldHeader: undefined,
       newHeader: undefined,
       hunks,
+    }, {
+      // Chosen explicitly, not inherited. jsdiff defaults this ON when the
+      // option is omitted, which silently rewrites an LF patch to match a CRLF
+      // original before comparing — so a "-b" line would delete "b\r", a byte
+      // the patch author never wrote, while this node advertises exact content
+      // matching. The default has moved in jsdiff's history and could move
+      // again; pinning it keeps the contract ours rather than the library's.
+      autoConvertLineEndings: false,
     });
 
     if (result === false) {

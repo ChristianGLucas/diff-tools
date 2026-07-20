@@ -13,5 +13,6 @@
     "lib": ["ES2020"]
   },
   "include": ["service.ts", "nodes/**/*.ts", "gen/**/*.ts", "gen/**/*.js"],
-  "exclude": ["node_modules", "dist", "**/*_test.ts", "**/*.test.ts"]
+  "exclude": ["node_modules", "dist", "**/*_test.ts",
+    "nodes/testkit.ts", "**/*.test.ts"]
 }

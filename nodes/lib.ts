@@ -20,10 +20,12 @@ export const MAX_CHARS = 1_000_000;
  * superlinearly, reaching ~44s at 20,000 lines — so the cap is what keeps a
  * hostile input from becoming a denial of service, not a stylistic limit.
  *
- * Note the cap bounds LINES, not the N*D product that actually drives cost, so
- * the worst case here is genuinely the worst case: minimal-length wholly
- * dissimilar lines maximise line count per byte, which is why a ~30KB body can
- * buy several seconds of CPU.
+ * The cap bounds LINES, which is NOT the product that drives cost — line LENGTH
+ * multiplies the per-comparison cost on top of O(N*D). Measured: 5,000 thin
+ * dissimilar lines cost ~6.7s, while 5,000 dissimilar lines of ~88 characters
+ * (a ~900KB request, inside every declared bound) cost ~9.1s. So thin lines are
+ * NOT the worst case, and MAX_CHARS is the bound that actually constrains the
+ * fat-line end. Both caps are needed; neither alone is sufficient.
  */
 export const MAX_LINES = 5_000;
 
@@ -39,6 +41,61 @@ export const MAX_LINES = 5_000;
  * budget must therefore admit any patch Diff itself can produce.
  */
 export const MAX_PATCH_LINES = 2 * MAX_LINES + 2;
+
+/**
+ * Maximum characters accepted for a patch expressed as unified-diff TEXT.
+ *
+ * Same reasoning as MAX_PATCH_LINES, for the other dimension: the text form
+ * carries both sides plus a one-character prefix per line and the "@@"/"---"
+ * headers, so it is inherently larger than either text it describes.
+ */
+export const MAX_PATCH_CHARS = 2 * MAX_CHARS + 4096;
+
+/**
+ * Maximum LINES accepted for a patch expressed as unified-diff TEXT.
+ *
+ * Larger than MAX_PATCH_LINES because the text form carries structure the hunk
+ * bodies do not: two "---"/"+++" file headers, one "@@" header per hunk, and up
+ * to two end-of-file markers. A hunk needs at least one body line, so the hunk
+ * headers cannot outnumber the body; allowing MAX_LINES of them plus a small
+ * constant covers any patch this package can produce or accept. Parsing is
+ * linear, and the quadratic cost lives in the diff, not here — so this bound
+ * exists to keep the document finite, not to throttle an algorithm.
+ */
+export const MAX_PATCH_TEXT_LINES = MAX_PATCH_LINES + MAX_LINES + 8;
+
+/**
+ * Rejects an oversized patch supplied as unified-diff TEXT.
+ *
+ * A diff is a PATCH, not a text, and must be budgeted as one on EVERY path that
+ * accepts a patch. Validating diff text with checkBounds applied the 5,000-LINE
+ * *text* cap to a document that is inherently ~2x the size of what it describes,
+ * so `Diff` emitted a diff that `ApplyPatch` then refused above ~2,500 changed
+ * lines — the round-trip guarantee breaking on the scalar path exactly as it had
+ * on the hunks path, for the same reason.
+ */
+export function checkPatchBounds(text: string, label: string): void {
+  if (text.length > MAX_PATCH_CHARS) {
+    throw new BadInput(
+      `${label} exceeds the maximum of ${MAX_PATCH_CHARS} characters (got ${text.length})`,
+    );
+  }
+  const lines = countLines(text);
+  if (lines > MAX_PATCH_TEXT_LINES) {
+    throw new BadInput(
+      `${label} exceeds the maximum of ${MAX_PATCH_TEXT_LINES} lines (got ${lines})`,
+    );
+  }
+}
+
+/**
+ * Maximum number of hunks in a single patch.
+ *
+ * Hunk COUNT needs its own bound: the line budget does not constrain it, and
+ * each hunk drives a locate-scan in the applier regardless of how small it is.
+ * Every real patch is far below this.
+ */
+export const MAX_HUNKS = 2_000;
 
 /** The only legal "\" body line in a unified diff. */
 export const NO_NEWLINE_MARKER = '\\ No newline at end of file';
@@ -128,9 +185,13 @@ export function nameOr(name: string, fallback: string): string {
   // they cannot forge a header — but they survive verbatim into the "--- "/"+++ "
   // position, where NUL, VT, FF and the C1 range corrupt terminals and logs and
   // break downstream tools that treat the header as a filename.
-  if (name && /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(name)) {
+  // Also reject bidi controls and zero-width characters. These split no line for
+  // any parser, so they cannot forge a header — but they make a name RENDER as a
+  // different path than it is in any terminal, editor, or review UI that shows
+  // the diff, which is its own deception. A path field has no use for them.
+  if (name && /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/.test(name)) {
     throw new BadInput(
-      'original_name / revised_name must not contain control characters or line separators',
+      'original_name / revised_name must not contain control, bidi, or zero-width characters',
     );
   }
   return name ? name : fallback;
@@ -180,11 +241,30 @@ export function toProtoHunks(hunks: StructuredPatch['hunks']): Hunk[] {
  * silently misapply or refuse without explanation.
  */
 export function fromProtoHunks(hunks: Hunk[], originalLines: number): StructuredPatch['hunks'] {
+  // Bound every dimension the caller controls, on the RAW hunks, before any
+  // conversion. Line count alone is not enough: a zero-line hunk contributes
+  // nothing to that budget yet still drives a scan in the applier, and a body
+  // line's LENGTH is unbounded, so 10,002 lines could carry gigabytes. Only the
+  // gateway's ~1MB body limit stood behind these, and that is an external
+  // control this node does not own.
+  if (hunks.length > MAX_HUNKS) {
+    throw new BadInput(`patch has more than ${MAX_HUNKS} hunks (got ${hunks.length})`);
+  }
   let totalLines = 0;
-  for (const h of hunks) totalLines += h.getLinesList().length;
+  let totalChars = 0;
+  for (const h of hunks) {
+    const body = h.getLinesList();
+    totalLines += body.length;
+    for (const line of body) totalChars += line.length;
+  }
   if (totalLines > MAX_PATCH_LINES) {
     throw new BadInput(
       `patch hunks span more than ${MAX_PATCH_LINES} lines in total (got ${totalLines})`,
+    );
+  }
+  if (totalChars > MAX_PATCH_CHARS) {
+    throw new BadInput(
+      `patch hunks span more than ${MAX_PATCH_CHARS} characters in total (got ${totalChars})`,
     );
   }
 
@@ -214,11 +294,25 @@ export function fromProtoHunks(hunks: Hunk[], originalLines: number): Structured
     // a ~150-byte patch declaring oldStart 2147483647 pins a core for ~30s.
     // The applier is given the original, so the only sane bound is knowable:
     // a hunk cannot legitimately begin past one line after the text ends.
-    const maxStart = originalLines + 1;
-    if (oldStart > maxStart || newStart > maxStart) {
+    // ONLY old_start may be bounded by the original: it is the only start the
+    // applier scans the given text for, so it is the only one carrying the DoS
+    // risk — and it is the only one this node can bound correctly.
+    //
+    // new_start indexes the REVISED text, which ApplyPatch does not have and
+    // which is LONGER than the original whenever the patch nets an insertion.
+    // Bounding it by originalLines rejected ordinary multi-hunk patches — insert
+    // a block early, edit further down, and the later hunk's new_start
+    // legitimately exceeds the original's length — so ApplyPatch refused patches
+    // Diff had just emitted. It gets the same sanity cap ParseUnifiedDiff uses.
+    if (oldStart > originalLines + 1) {
       throw new BadInput(
         `hunk ${i} starts past the end of the text ` +
-          `(old_start=${oldStart}, new_start=${newStart}, text has ${originalLines} lines)`,
+          `(old_start=${oldStart}, text has ${originalLines} lines)`,
+      );
+    }
+    if (newStart > MAX_LINES + 1) {
+      throw new BadInput(
+        `hunk ${i} has new_start=${newStart}, beyond the maximum of ${MAX_LINES} lines`,
       );
     }
 
@@ -256,8 +350,36 @@ export function fromProtoHunks(hunks: Hunk[], originalLines: number): Structured
             `hunk ${i} begins with a ${JSON.stringify(NO_NEWLINE_MARKER)} marker`,
           );
         }
-        if (lines[j - 1].charAt(0) === '\\') {
+        // Enforce the invariant, rather than merely stating it. jsdiff's applier
+        // scans the last hunk for ANY line starting with "\\" and, seeing the
+        // PRECEDING line's side, strips that side's trailing newline. So a marker
+        // parked mid-hunk after a "+" line silently removes the result's trailing
+        // newline while the "@@" counts still balance — the validator and the
+        // applier disagreeing about the same bytes again, and the round trip no
+        // longer reproducing the revised text exactly. A marker is legal ONLY
+        // where a side genuinely ends:
+        //   - after a "-" line, when the new side follows (old side ends), or
+        //   - as the hunk's final line (whichever side it terminates).
+        const prev = lines[j - 1].charAt(0);
+        const isLast = j === lines.length - 1;
+        if (prev === '\\') {
           throw new BadInput(`hunk ${i} has consecutive ${JSON.stringify(NO_NEWLINE_MARKER)} markers`);
+        }
+        // As the hunk's FINAL line the marker is always legal: it terminates
+        // whichever side(s) end there — including a shared context line, which
+        // is what GNU diff emits when both texts end without a trailing newline.
+        //
+        // Anywhere else, the only legal position is between the two runs: after
+        // the last "-" line and immediately before the first "+" line, marking
+        // the OLD side as unterminated. A marker parked mid-hunk after a "+"
+        // line, or after a context line, is not terminating anything — and jsdiff
+        // scans the last hunk for any "\\"-prefixed line and strips the trailing
+        // newline of the PRECEDING line's side, so such a marker silently changes
+        // the applied bytes while the "@@" counts still balance.
+        if (!isLast && !(prev === '-' && lines[j + 1].charAt(0) === '+')) {
+          throw new BadInput(
+            `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker that does not terminate a side`,
+          );
         }
         markers++;
         if (markers > 2) {
@@ -283,6 +405,10 @@ export function fromProtoHunks(hunks: Hunk[], originalLines: number): Structured
         oldBody++;
         newBody++;
       }
+    }
+
+    if (lines.length === 0) {
+      throw new BadInput(`hunk ${i} has an empty body`);
     }
 
     // The @@ header's declared line counts must match the body the hunk actually

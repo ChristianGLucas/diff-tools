@@ -2,7 +2,7 @@ import { applyPatch } from './apply_patch';
 import { diff } from './diff';
 import { Hunk, Patch, PatchApplyRequest, TextPair } from '../gen/messages_pb';
 import { ctx, CORPUS } from './testkit';
-import { MAX_CHARS, MAX_LINES, MAX_PATCH_LINES } from './lib';
+import { MAX_CHARS, MAX_HUNKS, MAX_LINES, MAX_PATCH_LINES, countLines } from './lib';
 
 const ORIGINAL = 'line1\nline2\nline3\nline4\nline5';
 const REVISED = 'line1\nline2\nCHANGED\nline4\nline5';
@@ -115,6 +115,108 @@ describe('ApplyPatch', () => {
       expect([label, out.getApplied(), out.getError()]).toEqual([label, true, '']);
       expect([label, out.getText()]).toEqual([label, revised]);
     }
+  });
+
+  // REGRESSION. new_start indexes the REVISED text, which is longer than the
+  // original whenever the patch nets an insertion, so bounding it by the
+  // ORIGINAL's line count rejected the single most common real edit shape:
+  // insert a block early, change something further down. The CORPUS has no
+  // multi-hunk net-insertion case, which is why a green suite missed it.
+  // Driven through BOTH supply paths, because the bug was reachable from each.
+  it('ROUND TRIP: a multi-hunk patch that nets an insertion applies on both paths', () => {
+    const original = Array.from({ length: 12 }, (_, i) => `L${i}`).join('\n') + '\n';
+    const inserted = Array.from({ length: 8 }, (_, i) => `N${i}`);
+    const revisedLines = ['L0', ...inserted, ...Array.from({ length: 11 }, (_, i) => `L${i + 1}`)];
+    revisedLines[revisedLines.length - 2] = 'CHANGED';
+    const revised = revisedLines.join('\n') + '\n';
+
+    const patch = makeDiff(original, revised);
+    expect(patch.getError()).toBe('');
+    // Guard the premise: a later hunk must really start past the ORIGINAL's end.
+    const starts = patch.getHunksList().map((h) => h.getNewStart());
+    expect(Math.max(...starts)).toBeGreaterThan(countLines(original) + 1);
+
+    const viaEnvelope = apply(original, patch);
+    expect(viaEnvelope.getError()).toBe('');
+    expect(viaEnvelope.getText()).toBe(revised);
+
+    const req = new PatchApplyRequest();
+    req.setOriginal(original);
+    req.setUnifiedDiff(patch.getUnifiedDiff());
+    const viaScalar = applyPatch(ctx, req);
+    expect(viaScalar.getError()).toBe('');
+    expect(viaScalar.getText()).toBe(revised);
+  });
+
+  // REGRESSION. jsdiff scans the last hunk for any "\\"-prefixed line and strips
+  // the trailing newline of the PRECEDING line's side. A marker parked mid-hunk
+  // after a "+" line therefore silently removed the result's trailing newline
+  // while the "@@" counts still balanced — validator and applier disagreeing
+  // about the same bytes, and the round trip no longer exact. Reachable through
+  // BOTH input paths, so any diff arriving from git or another agent could
+  // carry it.
+  it('SECURITY: rejects an end-of-file marker that does not terminate a side', () => {
+    const smuggled = hunk({ oldStart: 1, oldLines: 2, newStart: 1, newLines: 3 }, [
+      ' a', '+X', '\\ No newline at end of file', ' b',
+    ]);
+    const out = apply('a\nb\n', smuggled);
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('does not terminate a side');
+    expect(out.getText()).toBe('');
+
+    // The same smuggled marker arriving as unified-diff TEXT must also be refused.
+    const req = new PatchApplyRequest();
+    req.setOriginal('a\nb\n');
+    req.setUnifiedDiff('--- a\n+++ b\n@@ -1,2 +1,3 @@\n a\n+X\n\\ No newline at end of file\n b\n');
+    const viaText = applyPatch(ctx, req);
+    expect(viaText.getApplied()).toBe(false);
+    expect(viaText.getError()).toContain('does not terminate a side');
+
+    // A marker in a LEGITIMATE terminating position still works: as the final
+    // line, and between the "-" run and the "+" run.
+    expect(apply('a\nb', hunk({ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2 }, [
+      ' a', '-b', '\\ No newline at end of file', '+B', '\\ No newline at end of file',
+    ])).getError()).toBe('');
+  });
+
+  // A hunk that changes nothing passes every count check (0 === 0) and jsdiff
+  // "applies" it at the first probed position, so it reproduced exactly the
+  // silent no-op the hunk-less guard exists to prevent: applied:true, text
+  // unchanged, no error, and the caller believing their edit landed.
+  it('ERROR PATH: rejects a hunk with an empty body rather than applying a no-op', () => {
+    const out = apply('a\nb\n', hunk({ oldStart: 1, oldLines: 0, newStart: 1, newLines: 0 }, []));
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('empty body');
+  });
+
+  it('BOUNDS: rejects a patch with more hunks than the cap', () => {
+    const p = new Patch();
+    p.setHunksList(Array.from({ length: MAX_HUNKS + 1 }, () => {
+      const h = new Hunk();
+      h.setOldStart(1); h.setOldLines(1); h.setNewStart(1); h.setNewLines(1);
+      h.setLinesList([' a']);
+      return h;
+    }));
+    const out = apply('a\n', p);
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain(`more than ${MAX_HUNKS} hunks`);
+  });
+
+  // The node advertises EXACT content matching. jsdiff defaults
+  // autoConvertLineEndings ON when the option is omitted, which silently
+  // rewrites an LF patch to match a CRLF original — so "-b" would delete "b\r",
+  // a byte the patch author never wrote. Pinned off, so the mismatch is refused
+  // and the contract is ours rather than the library's default-of-the-day.
+  it('SECURITY: refuses an LF patch against a CRLF original instead of silently converting', () => {
+    const out = apply('a\r\nb\r\n', hunk({ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2 }, [' a', '-b', '+Z']));
+    expect(out.getApplied()).toBe(false);
+    expect(out.getText()).toBe('');
+
+    // A CRLF patch against a CRLF original still applies exactly.
+    const crlf = makeDiff('a\r\nb\r\n', 'a\r\nZ\r\n');
+    const ok = apply('a\r\nb\r\n', crlf);
+    expect(ok.getError()).toBe('');
+    expect(ok.getText()).toBe('a\r\nZ\r\n');
   });
 
   it('ERROR PATH: refuses a patch whose context does not match, without corrupting the text', () => {
@@ -304,22 +406,39 @@ describe('ApplyPatch', () => {
   // The patch budget must admit any patch Diff itself can emit, or the headline
   // round-trip guarantee breaks on input the package accepted without error.
   // A full rewrite is the worst case: every line appears once as "-", once as "+".
-  it('BOUNDS: a full rewrite at the line cap still round-trips through ApplyPatch', () => {
-    const n = MAX_LINES;
-    const original = Array.from({ length: n }, (_, i) => `alpha-${i}`).join('\n') + '\n';
-    const revised = Array.from({ length: n }, (_, i) => `beta-${i}`).join('\n') + '\n';
+  // Table-driven over BOTH supply modes on purpose. A previous round fixed the
+  // hunks path only, and the same defect survived on the unified_diff path
+  // because scale was tested on one path and the scalar path was tested at one
+  // (tiny) scale — the bug lived in the untested intersection. Any future
+  // divergence between the two validation paths must fail here.
+  describe.each([
+    ['envelope (patch)', (o: string, p: Patch) => apply(o, p)],
+    ['scalar (unified_diff)', (o: string, p: Patch) => {
+      const req = new PatchApplyRequest();
+      req.setOriginal(o);
+      req.setUnifiedDiff(p.getUnifiedDiff());
+      return applyPatch(ctx, req);
+    }],
+  ])('BOUNDS: a full rewrite at the line cap — %s path', (_label, applyVia) => {
+    it('still round-trips through ApplyPatch', () => {
+      const n = MAX_LINES;
+      const original = Array.from({ length: n }, (_, i) => `alpha-${i}`).join('\n') + '\n';
+      const revised = Array.from({ length: n }, (_, i) => `beta-${i}`).join('\n') + '\n';
 
-    const patch = makeDiff(original, revised);
-    expect(patch.getError()).toBe('');
-    // Guard the premise: this really is a patch bigger than the input line cap.
-    const body = patch.getHunksList().reduce((s, h) => s + h.getLinesList().length, 0);
-    expect(body).toBeGreaterThan(MAX_LINES);
+      const patch = makeDiff(original, revised);
+      expect(patch.getError()).toBe('');
+      // Guard the premise on BOTH dimensions: a patch is inherently ~2x the text
+      // it describes, so it exceeds the input line cap as hunks AND as text.
+      const body = patch.getHunksList().reduce((s, h) => s + h.getLinesList().length, 0);
+      expect(body).toBeGreaterThan(MAX_LINES);
+      expect(patch.getUnifiedDiff().split('\n').length).toBeGreaterThan(MAX_LINES);
 
-    const out = apply(original, patch);
-    expect(out.getError()).toBe('');
-    expect(out.getApplied()).toBe(true);
-    expect(out.getText()).toBe(revised);
-  }, 60_000);
+      const out = applyVia(original, patch);
+      expect(out.getError()).toBe('');
+      expect(out.getApplied()).toBe(true);
+      expect(out.getText()).toBe(revised);
+    }, 60_000);
+  });
 
   it('is deterministic across repeated invocations', () => {
     const patch = makeDiff(ORIGINAL, REVISED);

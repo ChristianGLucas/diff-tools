@@ -200,9 +200,15 @@ describe('Diff', () => {
   // Control characters additionally corrupt terminals and logs.
   it('SECURITY: rejects control characters and line separators in header names', () => {
     const forging = '\u2028+++ evil.txt\u2028@@ -1,1 +1,1 @@';
-    for (const bad of [forging, 'x\u0000y', 'x\u000by', 'x\u000cy', 'x\u0085y', 'x\u2029y']) {
+    // Line-splitting characters (the forging vector) plus bidi and zero-width
+    // characters, which split nothing but make a name RENDER as a different path
+    // than it is in any terminal, editor, or review UI showing the diff.
+    for (const bad of [
+      forging, 'x\u0000y', 'x\u000by', 'x\u000cy', 'x\u0085y', 'x\u2029y',
+      'x\u202e--- /etc/passwd', 'x\u200by', 'x\u200ey', 'x\u2066y',
+    ]) {
       const out = run('a\n', 'b\n', { on: bad });
-      expect([bad, out.getError()]).toEqual([bad, 'original_name / revised_name must not contain control characters or line separators']);
+      expect([bad, out.getError()]).toEqual([bad, 'original_name / revised_name must not contain control, bidi, or zero-width characters']);
       expect(out.getUnifiedDiff()).toBe('');
     }
     // A tab is legal in a filename field and must still be accepted.

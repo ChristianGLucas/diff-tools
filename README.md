@@ -69,18 +69,30 @@ re-parseable.
 - **Self-consistent envelope.** A `Patch`'s hunk numbers always match the `@@`
   headers in its own `unified_diff`, a hunk's header counts must match its body,
   and a parsed patch is indistinguishable from a generated one.
+- **Exact content matching, explicitly.** Line-ending conversion is pinned OFF:
+  an LF patch against a CRLF original is refused, not silently rewritten to fit.
+  (jsdiff enables that conversion by default when the option is omitted, which
+  would delete bytes the patch author never wrote.) Position is not pinned — as
+  with `git apply` and patch(1), a hunk whose context matches may apply at an
+  offset from its declared line number.
 - **Strict, not permissive.** Prose that merely *talks about* a change is
   rejected rather than silently reported as "no changes"; a malformed `@@` header
   is an error, not a null-numbered hunk; a patch whose context does not match is
   refused rather than fuzzy-matched; and a header name containing a line break,
   control character, or Unicode line separator — which could forge extra diff
-  headers or corrupt a downstream consumer — is rejected. A patch that arrives
+  headers, or a bidi/zero-width character that makes a name RENDER as a path it
+  is not, is rejected. Both nodes that mint a `Patch` apply the same name rule.
+  An end-of-file marker that does not actually terminate a side is refused, and
+  so is a hunk with an empty body — both silently altered the applied bytes. A patch that arrives
   carrying an upstream `error`, or with no hunks and not marked `identical`, is
   refused rather than applied as a silent no-op: a failed step upstream must not
   read as a successful identity.
 - **Bounded cost.** Inputs are capped at 1,000,000 characters and 5,000 lines per
-  text, and a patch body at 10,002 lines — twice the line cap, so any patch `Diff`
-  can emit is one `ApplyPatch` will accept. The diff is O(N·D), so two
+  text. A **patch** is budgeted separately and more generously, because it carries
+  both sides and is inherently ~2x the size of the text it describes: 10,002 hunk
+  body lines, and 15,010 lines / 2,004,096 characters in its unified-diff text
+  form. That applies on **every** path that accepts a patch, so any patch `Diff`
+  can emit is one `ApplyPatch` will accept — as the envelope *or* as text. The diff is O(N·D), so two
   wholly-dissimilar texts are the worst case: measured at roughly 2.0s at 2,000
   lines and **~7-8s at the 5,000-line cap**, versus the ~44s that 20,000 lines
   would take. Hunk start lines are bounded by the text being patched, because the

@@ -3,7 +3,7 @@ import { applyPatch } from './apply_patch';
 import { diff } from './diff';
 import { Patch, PatchApplyRequest, TextPair, UnifiedDiffText } from '../gen/messages_pb';
 import { ctx, CORPUS } from './testkit';
-import { MAX_CHARS, MAX_LINES } from './lib';
+import { MAX_PATCH_CHARS, MAX_PATCH_TEXT_LINES } from './lib';
 
 function parse(text: string): Patch {
   const input = new UnifiedDiffText();
@@ -109,12 +109,15 @@ describe('ParseUnifiedDiff', () => {
   });
 
   it('BOUNDS: rejects an oversized diff document', () => {
-    expect(parse('x'.repeat(MAX_CHARS + 1)).getError()).toContain(
-      `unified_diff exceeds the maximum of ${MAX_CHARS} characters`,
+    // A diff document is a PATCH, not a text: it carries both sides, so it is
+    // budgeted by the patch caps. Using the text caps here made ApplyPatch and
+    // ParseUnifiedDiff refuse diffs that Diff itself had just emitted.
+    expect(parse('x'.repeat(MAX_PATCH_CHARS + 1)).getError()).toContain(
+      `unified_diff exceeds the maximum of ${MAX_PATCH_CHARS} characters`,
     );
-    const overLines = Array.from({ length: MAX_LINES + 1 }, () => 'a').join('\n');
+    const overLines = Array.from({ length: MAX_PATCH_TEXT_LINES + 1 }, () => 'a').join('\n');
     expect(parse(overLines).getError()).toContain(
-      `unified_diff exceeds the maximum of ${MAX_LINES} lines`,
+      `unified_diff exceeds the maximum of ${MAX_PATCH_TEXT_LINES} lines`,
     );
   });
 
