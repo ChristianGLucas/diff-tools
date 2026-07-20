@@ -1,0 +1,7 @@
+# Axiom build artifacts
+.axiom/
+
+# Generated proto bindings — gen/ is committed (messages_pb.js/.d.ts, axiomContext.ts)
+# Node
+node_modules/
+dist/

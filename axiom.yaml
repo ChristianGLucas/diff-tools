@@ -1,0 +1,19 @@
+name: christiangeorgelucas/diff-tools
+version: 0.1.0
+language: typescript
+nodes:
+    - name: Diff
+      input: TextPair
+      output: Patch
+    - name: ApplyPatch
+      input: PatchApplyRequest
+      output: PatchApplyResult
+    - name: ParseUnifiedDiff
+      input: UnifiedDiffText
+      output: Patch
+    - name: Similarity
+      input: TextPair
+      output: SimilarityScore
+    - name: Stats
+      input: TextPair
+      output: DiffStats

@@ -1,0 +1,124 @@
+// Data contracts for christiangeorgelucas/diff-tools.
+//
+// The canonical envelope of this package is Patch: it carries BOTH the
+// unified-diff text and the structured hunks that encode the same change. Diff
+// and ParseUnifiedDiff emit a Patch; ApplyPatch consumes one. That makes the
+// package composable end to end:
+//   Diff -> Patch -> ApplyPatch              (reproduces the revised text exactly)
+//   ParseUnifiedDiff -> Patch -> ApplyPatch  (applies a diff produced anywhere)
+
+syntax = "proto3";
+
+package christiangeorgelucas.diff_tools;
+
+// One unified-diff hunk: a contiguous changed region plus its surrounding
+// context, in the standard @@ -oldStart,oldLines +newStart,newLines @@ form.
+message Hunk {
+  // 1-based first line of this hunk in the original text.
+  int32 old_start = 1;
+  // Number of original-text lines this hunk covers.
+  int32 old_lines = 2;
+  // 1-based first line of this hunk in the revised text.
+  int32 new_start = 3;
+  // Number of revised-text lines this hunk covers.
+  int32 new_lines = 4;
+  // The hunk body, one entry per line, each prefixed " " (context), "-"
+  // (removed), or "+" (added). A trailing "\ No newline at end of file" entry
+  // marks a text that does not end in a newline.
+  repeated string lines = 5;
+}
+
+// The canonical diff-tools envelope: a change between two texts, expressed both
+// as unified-diff text and as structured hunks. Emitted by Diff and
+// ParseUnifiedDiff; consumed by ApplyPatch.
+message Patch {
+  // The change in standard unified-diff format (---/+++/@@ hunks), byte-for-byte
+  // what GNU `diff -u` emits. Empty when the two texts are identical.
+  string unified_diff = 1;
+  // The same change as structured hunks, in original-text order.
+  repeated Hunk hunks = 2;
+  // Name on the "---" header line. Defaults to "original".
+  string original_name = 3;
+  // Name on the "+++" header line. Defaults to "revised".
+  string revised_name = 4;
+  // True when the original and revised texts are identical (no hunks).
+  bool identical = 5;
+  // Empty on success; a stable, human-readable reason on failure. When set,
+  // every other field is left at its zero value.
+  string error = 6;
+}
+
+// Two texts to compare, line by line.
+message TextPair {
+  // The original ("before") text.
+  string original = 1;
+  // The revised ("after") text.
+  string revised = 2;
+  // Name for the "---" header line of the generated diff. Default "original".
+  string original_name = 3;
+  // Name for the "+++" header line of the generated diff. Default "revised".
+  string revised_name = 4;
+  // Unchanged lines of context around each hunk. -1 means zero context; 0
+  // selects the default of 3. Values above 100, or below -1, are rejected.
+  int32 context_lines = 5;
+}
+
+// A unified-diff document to parse into the canonical Patch envelope.
+message UnifiedDiffText {
+  // Text in standard unified-diff format (---/+++/@@ hunks).
+  string unified_diff = 1;
+}
+
+// An original text plus the Patch to apply to it.
+message PatchApplyRequest {
+  // The text the patch applies to.
+  string original = 1;
+  // The patch to apply. Its structured hunks are what get applied; the
+  // unified_diff field is ignored by ApplyPatch.
+  Patch patch = 2;
+}
+
+// The result of applying a Patch to a text.
+message PatchApplyResult {
+  // The patched text. Empty when applied is false.
+  string text = 1;
+  // True when the patch applied cleanly.
+  bool applied = 2;
+  // Empty when applied is true; otherwise a stable, human-readable reason
+  // (for example, the patch's context does not match the original text).
+  string error = 3;
+}
+
+// Line-level similarity between two texts, derived from their line diff.
+message SimilarityScore {
+  // Fraction of lines the two texts share, in [0.0, 1.0], computed as
+  // 2 * matching_lines / (original_lines + revised_lines).
+  // Two empty texts score 1.0.
+  double ratio = 1;
+  // Number of lines the two texts have in common (the diff's unchanged lines).
+  int32 matching_lines = 2;
+  // Line count of the original text.
+  int32 original_lines = 3;
+  // Line count of the revised text.
+  int32 revised_lines = 4;
+  // Empty on success; a stable, human-readable reason on failure.
+  string error = 5;
+}
+
+// Counts of what changed between two texts, at line granularity.
+message DiffStats {
+  // Lines present only in the revised text.
+  int32 lines_added = 1;
+  // Lines present only in the original text.
+  int32 lines_deleted = 2;
+  // Number of contiguous changed regions.
+  int32 changed_blocks = 3;
+  // Line count of the original text.
+  int32 original_lines = 4;
+  // Line count of the revised text.
+  int32 revised_lines = 5;
+  // True when the original and revised texts are identical.
+  bool identical = 6;
+  // Empty on success; a stable, human-readable reason on failure.
+  string error = 7;
+}
