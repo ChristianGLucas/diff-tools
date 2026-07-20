@@ -240,7 +240,9 @@ export function toProtoHunks(hunks: StructuredPatch['hunks']): Hunk[] {
  * than guessed at — jsdiff itself is permissive here and would otherwise
  * silently misapply or refuse without explanation.
  */
-export function fromProtoHunks(hunks: Hunk[], originalLines: number): StructuredPatch['hunks'] {
+export function fromProtoHunks(hunks: Hunk[], original: string): StructuredPatch['hunks'] {
+  const originalLines = countLines(original);
+  const originalEndsWithNewline = original.length > 0 && original.charCodeAt(original.length - 1) === 10;
   // Bound every dimension the caller controls, on the RAW hunks, before any
   // conversion. Line count alone is not enough: a zero-line hunk contributes
   // nothing to that budget yet still drives a scan in the applier, and a body
@@ -320,6 +322,7 @@ export function fromProtoHunks(hunks: Hunk[], originalLines: number): Structured
     let oldBody = 0; // lines the hunk consumes from the original: context + removed
     let newBody = 0; // lines the hunk produces in the revised text: context + added
     let markers = 0; // "\ No newline at end of file" markers seen in this hunk
+    let sawMarker = false;
     for (let j = 0; j < lines.length; j++) {
       const line = lines[j];
       const prefix = line.charAt(0);
@@ -365,22 +368,51 @@ export function fromProtoHunks(hunks: Hunk[], originalLines: number): Structured
         if (prev === '\\') {
           throw new BadInput(`hunk ${i} has consecutive ${JSON.stringify(NO_NEWLINE_MARKER)} markers`);
         }
-        // As the hunk's FINAL line the marker is always legal: it terminates
-        // whichever side(s) end there — including a shared context line, which
-        // is what GNU diff emits when both texts end without a trailing newline.
-        //
-        // Anywhere else, the only legal position is between the two runs: after
-        // the last "-" line and immediately before the first "+" line, marking
-        // the OLD side as unterminated. A marker parked mid-hunk after a "+"
-        // line, or after a context line, is not terminating anything — and jsdiff
-        // scans the last hunk for any "\\"-prefixed line and strips the trailing
-        // newline of the PRECEDING line's side, so such a marker silently changes
-        // the applied bytes while the "@@" counts still balance.
+        // Structural position. A marker terminates a RUN, so it is legal as the
+        // hunk's final line (ending whichever side stops there — including a
+        // shared context line, which is exactly what jsdiff's own formatter
+        // emits when both texts end unterminated), or between the "-" run and
+        // the "+" run, ending the OLD side only.
         if (!isLast && !(prev === '-' && lines[j + 1].charAt(0) === '+')) {
           throw new BadInput(
             `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker that does not terminate a side`,
           );
         }
+        // A mid-hunk marker declares that the OLD side ends right here, so no
+        // later line may belong to the old side. Checking only that a "+"
+        // follows is not enough: a context line further down is on BOTH sides,
+        // so the old side would in fact continue past the marker. jsdiff honours
+        // the marker regardless and pushes a trailing newline, producing the
+        // opposite of what a later marker in the same hunk declares.
+        if (!isLast) {
+          for (let k = j + 1; k < lines.length; k++) {
+            const p2 = lines[k].charAt(0);
+            const onOldSide = p2 === '-' || p2 === ' ' || lines[k] === '';
+            if (onOldSide) {
+              throw new BadInput(
+                `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker for the original, ` +
+                  `but the original side continues after it`,
+              );
+            }
+          }
+        }
+        // CONSISTENCY with the text being patched. A marker is a DECLARATION —
+        // "the side ending here has no trailing newline" — and jsdiff's EOFNL
+        // prescan only ever acts on a marker preceded by "+" or "-". A marker
+        // that makes a claim about the OLD side (preceded by "-", or by a
+        // context line, which belongs to both sides) is therefore checkable
+        // against the original we were handed, and must be refused when it
+        // contradicts it. Without this a patch could declare "the result does
+        // not end in a newline" against an original that does, the applier would
+        // ignore the declaration, and the output would silently carry a newline
+        // the patch forbade — the applied bytes disagreeing with the patch.
+        if (prev !== '+' && originalEndsWithNewline) {
+          throw new BadInput(
+            `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker for the original, ` +
+              `but the original does end with a newline`,
+          );
+        }
+        sawMarker = true;
         markers++;
         if (markers > 2) {
           throw new BadInput(
@@ -420,6 +452,32 @@ export function fromProtoHunks(hunks: Hunk[], originalLines: number): Structured
         `hunk ${i} header (old_lines=${oldLines}, new_lines=${newLines}) does not match its body ` +
           `(counted old=${oldBody}, new=${newBody})`,
       );
+    }
+
+    // A marker is only MEANINGFUL for a hunk that actually reaches the end of the
+    // file, and jsdiff enforces nothing of the kind: its EOFNL pass scans only
+    // the LAST hunk for a "\\" line, reads the preceding line's prefix, and then
+    // pops or pushes a trailing empty line on the WHOLE result before any hunk is
+    // fitted. So a structurally-legal marker on a hunk that touches line 1 of a
+    // long file silently adds or removes the trailing newline of the entire
+    // output, with the "@@" counts still balancing and applied coming back true.
+    // Validating the marker's neighbours is therefore not enough — the side it
+    // claims to terminate must genuinely end at EOF, and only the final hunk can.
+    if (sawMarker) {
+      if (i !== hunks.length - 1) {
+        throw new BadInput(
+          `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker but is not the last hunk`,
+        );
+      }
+      // Where the old side stops. A hunk that consumes nothing (a pure addition,
+      // e.g. against an empty original) stops at its own start.
+      const endOfOldSide = oldBody > 0 ? oldStart + oldBody - 1 : oldStart;
+      if (endOfOldSide !== originalLines) {
+        throw new BadInput(
+          `hunk ${i} has a ${JSON.stringify(NO_NEWLINE_MARKER)} marker but does not reach the end ` +
+            `of the text (hunk ends at line ${endOfOldSide}, text has ${originalLines} lines)`,
+        );
+      }
     }
 
     // Back to jsdiff's in-memory convention (see toProtoHunks): an empty-side

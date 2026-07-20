@@ -1,7 +1,7 @@
 import { UnifiedDiffText, Patch } from '../gen/messages_pb';
 import { AxiomContext } from '../gen/axiomContext';
 import { parsePatch } from 'diff';
-import { BadInput, MAX_LINES, checkPatchBounds, errorMessage, headerNames, nameOr, toProtoHunks } from './lib';
+import { BadInput, MAX_HUNKS, MAX_LINES, checkPatchBounds, errorMessage, headerNames, nameOr, toProtoHunks } from './lib';
 
 /**
  * Parse standard unified-diff text (---/+++/@@ hunks) into the canonical Patch
@@ -73,14 +73,24 @@ export function parseUnifiedDiff(ax: AxiomContext, input: UnifiedDiffText): Patc
 
     const hunks = parsed.length === 0 ? [] : parsed[0].hunks;
 
+    // Bound the hunk count here as well as in ApplyPatch. A Patch minted from
+    // hostile diff text should not be able to carry a shape its sibling node
+    // would refuse; the envelope's invariants belong at every point that mints
+    // one, not only at the point that consumes one.
+    if (hunks.length > MAX_HUNKS) {
+      throw new BadInput(
+        `unified_diff has more than ${MAX_HUNKS} hunks (got ${hunks.length})`,
+      );
+    }
+
     // A malformed "@@" header yields a hunk with null/NaN line numbers rather
     // than an exception; reject those instead of passing them to ApplyPatch.
     hunks.forEach((h, i) => {
-      for (const [field, value] of [
-        ['old_start', h.oldStart],
-        ['old_lines', h.oldLines],
-        ['new_start', h.newStart],
-        ['new_lines', h.newLines],
+      for (const [field, value, zeroLineSide] of [
+        ['old_start', h.oldStart, h.oldLines === 0],
+        ['old_lines', h.oldLines, false],
+        ['new_start', h.newStart, h.newLines === 0],
+        ['new_lines', h.newLines, false],
       ] as const) {
         if (typeof value !== 'number' || !Number.isFinite(value)) {
           throw new BadInput(
@@ -99,9 +109,20 @@ export function parseUnifiedDiff(ax: AxiomContext, input: UnifiedDiffText): Patc
         // the declared start, so a header of "@@ -2000000000,1 +2000000000,1 @@"
         // costs ~30s of CPU at the far end. No line number in a diff this
         // package will accept can legitimately exceed the input line cap.
-        if (value > MAX_LINES) {
+        // Bound the TEXT numbering, which is what the caller wrote and what the
+        // envelope commits to — not jsdiff's in-memory normalization, which
+        // reports start+1 for a zero-line side. Checking the normalized value
+        // refused a legal "@@ -5000,0 +5001,1 @@" append at the cap that the
+        // sibling path accepted, and reported "old_start=5001" for a header
+        // plainly reading -5000, which a caller cannot reconcile with their
+        // diff. MAX_LINES + 1 matches fromProtoHunks: lines+1 is the legitimate
+        // append position. The two readers of one patch must agree, off-by-one
+        // included — a disagreement is how a patch becomes acceptable to one
+        // node and refused by its sibling.
+        const asWritten = zeroLineSide ? value - 1 : value;
+        if (asWritten > MAX_LINES + 1) {
           throw new BadInput(
-            `unified_diff has ${field}=${value} at hunk ${i}, beyond the maximum of ${MAX_LINES} lines`,
+            `unified_diff has ${field}=${asWritten} at hunk ${i}, beyond the maximum of ${MAX_LINES} lines`,
           );
         }
       }

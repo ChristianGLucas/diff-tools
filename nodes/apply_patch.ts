@@ -1,7 +1,7 @@
 import { PatchApplyRequest, PatchApplyResult, UnifiedDiffText } from '../gen/messages_pb';
 import { AxiomContext } from '../gen/axiomContext';
 import { applyPatch as jsApplyPatch } from 'diff';
-import { checkBounds, checkPatchBounds, countLines, errorMessage, fromProtoHunks, nameOr } from './lib';
+import { checkBounds, checkPatchBounds, errorMessage, fromProtoHunks, nameOr } from './lib';
 import { parseUnifiedDiff } from './parse_unified_diff';
 
 /** A refusal: never a partially-patched text, so text stays empty. */
@@ -110,7 +110,7 @@ export function applyPatch(ax: AxiomContext, input: PatchApplyRequest): PatchApp
       return failed('patch has no hunks and is not marked identical');
     }
 
-    const hunks = fromProtoHunks(protoHunks, countLines(original));
+    const hunks = fromProtoHunks(protoHunks, original);
 
     const out = new PatchApplyResult();
     if (hunks.length === 0) {

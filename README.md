@@ -19,8 +19,10 @@ ParseUnifiedDiff -> Patch -> ApplyPatch      # applies a diff produced anywhere
 
 **Composing inside a flow.** A flow edge currently carries only *scalar* leaves,
 so the nested `Patch` message cannot be routed across one — attempting it fails
-at run time with `encoding kind KIND_MESSAGE not implemented`, after compiling
-green. `ApplyPatch` therefore also accepts the diff as **text**, via its scalar
+— depending on the adapter's shape, either at compile time (a dotted
+path into `patch` is rejected: "field hunks not found in PatchApplyRequest") or,
+worse, only at run time with `encoding kind KIND_MESSAGE not implemented` after
+compiling green. `ApplyPatch` therefore also accepts the diff as **text**, via its scalar
 `unified_diff` input, which is how the chain is wired in a flow:
 
 ```
@@ -95,9 +97,11 @@ re-parseable.
   can emit is one `ApplyPatch` will accept — as the envelope *or* as text. The diff is O(N·D), so two
   wholly-dissimilar texts are the worst case: measured at roughly 2.0s at 2,000
   lines and **~7-8s at the 5,000-line cap**, versus the ~44s that 20,000 lines
-  would take. Hunk start lines are bounded by the text being patched, because the
-  applier locates a hunk by scanning outward from the declared start — an
-  unbounded start is a denial of service that no size cap constrains.
+  would take. The hunk start the applier actually scans for (`old_start`) is
+  bounded by the text being patched, because locating a hunk means scanning
+  outward from the declared start — an unbounded start is a denial of service no
+  size cap constrains. `new_start` indexes a revised text `ApplyPatch` never
+  sees, so it gets the same 5,000-line sanity cap instead.
 - **Deterministic and offline.** No network, no state, no secrets, no clock.
 
 ### Line model
@@ -115,8 +119,10 @@ Failures come back in one of two shapes, and the difference is worth knowing:
   mismatch, prose instead of a diff, an out-of-range `context_lines`, a bound
   exceeded) — return a **success status with an in-band `error` field** set on
   the output message, and the other fields zeroed. Every node uses this contract,
-  with stable wording. `ApplyPatch` additionally sets `applied: false`, and never
-  returns a half-patched text: on any failure `text` is empty.
+  with stable wording. `ApplyPatch` additionally leaves `applied` false — omitted from the
+  JSON, since proto3 elides scalar defaults, so test the `error` field rather
+  than `applied === false` — and never returns a half-patched text: on any
+  failure `text` is empty.
 - **Schema failures** — input that does not match the message type at all (a
   number where a string belongs) — are rejected by the platform *before* the node
   runs, and come back as a transport-level **400** in a different shape

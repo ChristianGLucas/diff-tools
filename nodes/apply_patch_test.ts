@@ -219,6 +219,90 @@ describe('ApplyPatch', () => {
     expect(ok.getText()).toBe('a\r\nZ\r\n');
   });
 
+  // REGRESSION (the fourth instance of validator-vs-applier disagreement).
+  // jsdiff's EOFNL pass scans only the LAST hunk for a "\\" line, reads the
+  // preceding line's prefix, then pops or pushes a trailing empty line on the
+  // WHOLE result before any hunk is fitted. So a STRUCTURALLY legal marker on a
+  // hunk that touches line 1 of a long file silently added or removed the
+  // trailing newline of the entire output, counts balancing and applied:true.
+  // Validating the marker's neighbours is not enough — the side it claims to
+  // terminate must actually end at EOF, and only the final hunk can.
+  it('SECURITY: refuses an end-of-file marker on a hunk that does not reach the end', () => {
+    // Would have silently ADDED a trailing newline.
+    const adds = apply('a\nb\nc', hunk({ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1 }, [
+      '-a', '\\ No newline at end of file', '+X',
+    ]));
+    expect(adds.getApplied()).toBe(false);
+    expect(adds.getError()).toContain('does not reach the end');
+
+    // Would have silently REMOVED the trailing newline.
+    const removes = apply('a\nb\nc\n', hunk({ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1 }, [
+      '-a', '+X', '\\ No newline at end of file',
+    ]));
+    expect(removes.getApplied()).toBe(false);
+    expect(removes.getError()).toContain('does not reach the end');
+
+    // Same corruption arriving as unified-diff TEXT is refused too.
+    const req = new PatchApplyRequest();
+    req.setOriginal('a\nb\nc');
+    req.setUnifiedDiff('--- o\n+++ r\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+X\n');
+    const viaText = applyPatch(ctx, req);
+    expect(viaText.getApplied()).toBe(false);
+    expect(viaText.getError()).toContain('does not reach the end');
+
+    // A marker on a hunk that DOES reach the end still works — this is the
+    // legitimate case the rule must not break.
+    const ok = apply('a\nb', hunk({ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2 }, [
+      ' a', '-b', '\\ No newline at end of file', '+B', '\\ No newline at end of file',
+    ]));
+    expect(ok.getError()).toBe('');
+    expect(ok.getText()).toBe('a\nB');
+  });
+
+  it('SECURITY: refuses an end-of-file marker on a non-final hunk', () => {
+    const p = new Patch();
+    const h1 = new Hunk();
+    h1.setOldStart(1); h1.setOldLines(1); h1.setNewStart(1); h1.setNewLines(1);
+    h1.setLinesList(['-a', '+X', '\\ No newline at end of file']);
+    const h2 = new Hunk();
+    h2.setOldStart(3); h2.setOldLines(1); h2.setNewStart(3); h2.setNewLines(1);
+    h2.setLinesList(['-c', '+Z']);
+    p.setHunksList([h1, h2]);
+    const out = apply('a\nb\nc\n', p);
+    expect(out.getApplied()).toBe(false);
+    expect(out.getError()).toContain('is not the last hunk');
+  });
+
+  // REGRESSION. A marker is a DECLARATION — "the side ending here has no
+  // trailing newline" — and jsdiff's EOFNL prescan acts on it without checking
+  // whether the claim is true. Three ways a structurally-legal marker lied:
+  it('SECURITY: refuses an end-of-file marker whose claim contradicts the text', () => {
+    // (1) Marker after a final context line, but the original DOES end with a
+    // newline — the patch declares the result unterminated, jsdiff ignores the
+    // declaration, and the output silently keeps the newline.
+    const contradicts = apply('a\nb\n', hunk({ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2 }, [
+      '-a', '+A', ' b', '\\ No newline at end of file',
+    ]));
+    expect(contradicts.getApplied()).toBe(false);
+    expect(contradicts.getError()).toContain('the original does end with a newline');
+
+    // (2) Mid-hunk marker claiming the old side ends, with a context line still
+    // to come — so the old side does NOT end there. jsdiff honoured the first
+    // marker and PUSHED a newline, the exact opposite of the final marker.
+    const continues = apply('a\nc', hunk({ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2 }, [
+      '-a', '\\ No newline at end of file', '+b', ' c', '\\ No newline at end of file',
+    ]));
+    expect(continues.getApplied()).toBe(false);
+    expect(continues.getError()).toContain('the original side continues after it');
+
+    // The honest form of (2) — nothing on the old side after the marker — works.
+    const honest = apply('a\nb', hunk({ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2 }, [
+      ' a', '-b', '\\ No newline at end of file', '+B', '\\ No newline at end of file',
+    ]));
+    expect(honest.getError()).toBe('');
+    expect(honest.getText()).toBe('a\nB');
+  });
+
   it('ERROR PATH: refuses a patch whose context does not match, without corrupting the text', () => {
     const out = apply(
       'totally\ndifferent\ntext\nhere\nnow',
