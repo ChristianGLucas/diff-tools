@@ -1,6 +1,6 @@
 # diff-tools
 
-Composable text-diff nodes for the [Axiom](https://axiom.dev) marketplace,
+Composable text-diff nodes for the [Axiom](https://axiomide.com) marketplace,
 published as `christiangeorgelucas/diff-tools`.
 
 Agents produce and consume patches constantly — proposing an edit, reviewing a
